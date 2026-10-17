@@ -1,5 +1,7 @@
 # dsh-memory-refine
 
+**简体中文 | [English](README.en.md)**
+
 DSH（DeepSeek Harness）的「记忆提炼」插件：把一场长对话提炼成候选条目，你逐条点头，再写进长期记忆文件 —— 面板里能直接看、直接改、直接删。
 
 > 这不是商业产品，是我自己用出来的东西 —— 你要想要，拿去。（MIT）
