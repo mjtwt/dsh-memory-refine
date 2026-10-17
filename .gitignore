@@ -1,0 +1,8 @@
+node_modules/
+*.log
+.DS_Store
+Thumbs.db
+
+# 运行时产物（正常情况下不在仓库目录里，防手滑）
+memory-refine-backups/
+memory-refine-scratch/
