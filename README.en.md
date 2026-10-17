@@ -7,6 +7,8 @@ A "memory refine" plugin for DSH (DeepSeek Harness): it distills a long conversa
 > This is not a commercial product; it is something I built because I needed it. Take it if you want it. (MIT)
 > Every judgement it makes rests on one premise: long-term memory is something you confirmed by hand, not something the model accumulated on its own.
 
+![The Memory Refine panel](docs/panel.png)
+
 ---
 
 ## What it solves
