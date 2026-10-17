@@ -129,6 +129,10 @@ Every write goes through one path (`confirmAndWrite` in `index.js`):
 2. **Full backup** — a copy is written to `DSH_HOME/memory-refine-backups/` first;
 3. **Read-back verification** — the file is read back immediately after writing and compared byte for byte; any mismatch is reported as a failure.
 
+A successful write looks like this (version, line delta, verification result and backup path, all in one line):
+
+![A successful write: version hash, line delta, read-back verification and the backup path](docs/write-result.png)
+
 Also:
 
 - **A write requires the user's explicit yes.** If the question service is unavailable it refuses outright; it does **not** silently degrade to "auto-approve".
