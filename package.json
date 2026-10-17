@@ -21,6 +21,9 @@
     "./locale/*": "./locale/*",
     "./package.json": "./package.json"
   },
+  "scripts": {
+    "test": "node test/smoke.mjs"
+  },
   "dsh": {
     "bundle": {
       "patch": "./cordis.patch.yml"

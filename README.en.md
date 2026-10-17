@@ -199,11 +199,32 @@ memory-refine/
 ├── gather.js       Pure functions: session event stream → refinement material (no cordis dependency, testable on its own)
 ├── memory.js       Managed-file access layer: whitelist + version hash + backup + read-back verification
 ├── protocol.js     The full refinement protocol (injected as a skill)
+├── test/smoke.mjs  Offline smoke test: fake ctx + sandboxed DSH_HOME
 ├── cordis.patch.yml Tells DSH which line to insert
 └── package.json
 ```
 
 `gather.js` is deliberately pure: it takes an array of events and returns text, touching no disk. That way you can replay exported session logs in a sandbox over and over without restarting DSH.
+
+---
+
+## Tests
+
+```
+node test/smoke.mjs
+```
+
+No DSH process and no real memory files — it loads the host half with a fake `ctx`, points `DSH_HOME` at a sandbox in the OS temp directory, and removes it afterwards.
+
+20 assertions, aimed less at "does it work" and more at **the branches you cannot reach by clicking**:
+
+- The four gates: `POST` only (405), known sub-paths only (404), JSON only (415), trust rejection passed through unchanged (403)
+- Whitelist escape rejected (`../../etc/passwd`)
+- Writes: read-back verification passes, and a backup file really is created
+- **Aborts when the version is stale** (`deadbeefdeadbeef` → not a single byte written)
+- Import spacing, and the delete backup naming plus the "it really is gone" check
+
+Producing those branches by hand means restarting DSH once per case. In the assertions they are three lines each.
 
 ---
 
