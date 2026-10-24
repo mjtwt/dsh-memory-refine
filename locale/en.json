@@ -1,6 +1,6 @@
 {
   "meta": {
     "title": "Memory Refine",
-    "description": "Distill long conversations into long-term memory entries you explicitly approve. Reads the session event stream, strips injected prompts, runtime snapshots and reasoning text; every candidate must be confirmed before it is written; writes pass a version pre-check, a full backup and a byte-for-byte read-back. A sidebar panel lets you read, edit, import and delete memory files."
+    "description": "Distill long conversations into long-term memory entries you explicitly approve — and let the model recall earlier passages by keyword instead of reading whole files. Reads the session event stream, strips injected prompts, runtime snapshots and reasoning text; every candidate must be confirmed before it is written; writes pass a version pre-check, a full backup and a byte-for-byte read-back. Recall is read-only, writes nothing to disk, and returns one memory per passage with line numbers and version. A sidebar panel lets you read, edit, import and delete memory files."
   }
 }

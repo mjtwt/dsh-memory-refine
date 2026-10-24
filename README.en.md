@@ -4,6 +4,8 @@
 
 A "memory refine" plugin for DSH (DeepSeek Harness): it distills a long conversation into candidate entries, you approve them one by one, and only then do they land in your long-term memory files — which you can read, edit and delete directly in a panel.
 
+The other direction is covered too: **when it needs to "remember something from before", it never has to read a whole file.** A keyword recall returns a few passages with line numbers (one memory per passage, ~400 characters), in about 12 ms.
+
 > This is not a commercial product; it is something I built because I needed it. Take it if you want it. (MIT)
 > Every judgement it makes rests on one premise: long-term memory is something you confirmed by hand, not something the model accumulated on its own.
 
@@ -15,7 +17,8 @@ A "memory refine" plugin for DSH (DeepSeek Harness): it distills a long conversa
 
 - Session logs keep growing (hundreds of events per conversation), while real long-term memory is only a handful of `.md` files;
 - Refining by hand is error-prone, and it is even easier to mistake **engine-injected prompts** for "something the user said";
-- Editing memory files directly has no safety net: break something and you cannot roll back; two writers (you and the model) overwrite each other.
+- Editing memory files directly has no safety net: break something and you cannot roll back; two writers (you and the model) overwrite each other;
+- When the model wants to "remember something from before" it has only two options: **read the whole file** (33KB in one shot) or not read at all — the middle gear ("just the relevant few entries") was missing, and whole-file reads are both expensive and prone to treating an unrelated entry as fact.
 
 ---
 
@@ -74,17 +77,42 @@ The plugin only handles *how to write safely*; **what to write** is still up to 
 
 ---
 
-## Five tools
+## Six tools
 
-The plugin registers five model-callable tools, all of which only touch whitelisted files.
+The plugin registers six model-callable tools, all of which only touch whitelisted files.
 
 | Tool | What it does |
 | --- | --- |
 | `memory_list` | Lists managed files: the injected layer `AGENTS.md`, the index, topic notes and the archive — with version hashes and line counts |
 | `memory_read` | Reads a managed file (paginated), returning its layer, version and total line count |
+| `memory_recall` | Recalls the few relevant passages for a keyword: returns `path:start-end`, version and the passage itself — never the whole file, and no extra read once it answers |
 | `memory_gather` | Turns a session into refinement material, writes it to disk as markdown, returns a preview and statistics |
 | `memory_write` | Writes to a managed file. **Nothing lands until the user says yes** |
 | `memory_import` | Imports external content into a memory file (new section / append) |
+
+### `memory_recall`: recall first, read closely second
+
+When you need "what did we decide before", call this instead of reading a whole file (one topic file here is 33KB). **The passages it returns usually already contain the answer** — answer from them, don't read the same lines again.
+
+- **Segmentation**: memory files split **per entry** (`- ` start lines / blank lines / headings) — one entry per segment. These files turned out to be one-memory-per-line (`- **title**: body` on a single physical line), so there is nothing to batch up. Rule documents (the injected layer) keep the old "accumulate 600 characters, then cut" rule: they are short one-sentence lists, and per-entry splitting shatters them into 40 segments, 20 of them under 60 characters. Both keep a hard character cut as a backstop — never a 10KB monster segment.
+- **Scoring**: TF-IDF over Chinese 2-grams, length-normalised, with a coverage gate (fewer than half of the query tokens hit → not returned). Missing a hit beats padding the list.
+- **Archive is opt-in**: the `archive/` layer holds superseded snapshots and is excluded by default (`scope:"live"`); pass `scope:"all"` to search it.
+- **The injected layer is excluded too**: `AGENTS.md` sits in the context in full every turn, so recalling its passages adds no information — it only crowds the budget on one common word. Pass `scope:"inject"` to search it.
+- **Output**: each hit carries `path` / `startLine` / `endLine` / `version` plus the passage itself. When the passage is intact the render says "cite it as is" and **emits no `memory_read` call at all**; only a truncated passage gets a copy-pasteable offset. Recall points at the spot — close reading is always optional.
+- **No hits**: returns a list of live files (path + heading) instead of nothing. No synonyms, no fuzzy matching.
+- **Batch what should be batched, skip what should be skipped**: for several unrelated terms, issue multiple `memory_recall` calls **in one message**; for one term (or a prefix of it), don't search twice at all. Every serial step re-pays the whole context plus that step's reasoning — measured: 4 serial steps ¥0.30 vs one batched step ¥0.077 for the same job. It looks like "one more lookup"; on the bill it is "one more think".
+
+The matching guardrail lives in `memory_read`: without an explicit `limit` it returns at most **8KB** (`我们的线.md` stops at line 21) and says in the header how much was withheld. This gate is necessary — in practice the model still makes one "just to be safe" argument-less `memory_read` even when the injected layer forbids reading whole files, and an 88-line file under the 250-line default page means dumping all 33KB. **What prompt wording can't enforce, code should.**
+
+One recall is capped at 2400 characters (≤5.7KB rendered). Acceptance script: `node test/recall.mjs` (read-only, runs against real data).
+
+> The per-hit cap is 1200 characters, and the number is data-driven rather than a "give a fixed slice" choice: after switching to one-entry-per-segment, the 86 live segments measure **P50=363, P90=740, P95=960, max 1744** — only one exceeds 1200. So at this value **98% of entries are handed over whole, with no "truncated" note at all**. At the earlier 400 / 750 most segments were longer than the window, so nearly every hit carried that note — which is the same as carrying none, while still provoking a follow-up read. **Truncating saves nothing; it provokes a 6.5KB follow-up read.** Handing over the whole passage is cheaper.
+
+**The user never has to name the tool, and the trigger lives in exactly one place**: the rule in `AGENTS.md` §4. It is static, visible every turn, and served from the prefix cache — near-zero marginal cost.
+
+**Recall is deliberately not a skill.** A skill has to be loaded before its body is readable, which adds a tool round-trip and a full protocol dump per trigger; worse, the model re-derives the rule "to follow procedure" — observed in practice as "check the injected rule, decide whether to load the skill, then follow the skill", i.e. one decision made twice. One rule, one home. Recall output arrives as a tool result appended to the conversation, so the system prompt is never rewritten and the prefix cache stays warm.
+
+> Why no per-turn auto-injection: the host does expose a `system-prompt/assemble` hook, but inserting a variable section into the system prompt invalidates the prefix cache from that point on — in a long session that single turn can cost an order of magnitude more. Static rules belong in the injected layer `AGENTS.md`, where the content never changes and the cache always hits.
 
 ### `memory_gather` parameters
 
@@ -194,11 +222,13 @@ On the next gathering, `deriveWatermark()` scans the session log's `tool/result`
 
 ```
 memory-refine/
-├── index.js        Host half: skill + 5 tools + the UI bridge
+├── index.js        Host half: skill + 6 tools + the UI bridge
 ├── client.js       Browser half: sidebar icon + main panel
 ├── gather.js       Pure functions: session event stream → refinement material (no cordis dependency, testable on its own)
 ├── memory.js       Managed-file access layer: whitelist + version hash + backup + read-back verification
 ├── protocol.js     The full refinement protocol (injected as a skill)
+├── search.js       Pure functions: segmentation + tokenising + TF-IDF scoring (recall)
+├── test/recall.mjs Recall acceptance: runs against real memory data, read-only
 ├── test/smoke.mjs  Offline smoke test: fake ctx + sandboxed DSH_HOME
 ├── cordis.patch.yml Tells DSH which line to insert
 └── package.json
