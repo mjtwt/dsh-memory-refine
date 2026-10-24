@@ -3,9 +3,11 @@
  *
  * Two layers live here:
  *   1. a runtime skill carrying the refinement protocol (no disk effect);
- *   2. five tools: four are the only path through which this plugin can touch
- *      the user's memory files or the prompt-injection layer, and one turns a
- *      session log into refinement material (read-only).
+ *   2. six tools: four are the only path through which this plugin can touch
+ *      the user's memory files or the prompt-injection layer, one turns a
+ *      session log into refinement material (read-only), and one is a
+ *      read-only keyword recall that hands back line numbers instead of whole
+ *      files (see search.js).
  *
  * The write path is deliberately paranoid, because the thing it edits is the
  * one file the user cannot regenerate. Every write goes through:
@@ -26,6 +28,7 @@ import {
 import { basename, isAbsolute, join, resolve } from 'node:path'
 import { PROTOCOL } from './protocol.js'
 import { deriveWatermark, gatherEvents, shortSessionId } from './gather.js'
+import { recall } from './search.js'
 import {
   DSH_HOME,
   MEMORY_DIR,
@@ -120,10 +123,10 @@ const LIST_TOOL = {
 
 /* ------------------------------------------------------------------ read */
 
-const READ_TOOL = {
+export const READ_TOOL = {
   name: 'memory_read',
   description:
-    '读取某个记忆文件或注入层文件的正文（分页，默认 250 行）。返回的 version 要原样带进 memory_write，用来防止覆盖掉你看过之后别人做的改动。',
+    '读取某个记忆文件或注入层文件的正文（分页；不指定 limit 时单次最多给 8KB，超出会明确告诉你）。**为了找某件事不要用它整份翻**——先用 memory_recall 定位到行，再看要不要读。返回的 version 要原样带进 memory_write，用来防止覆盖掉你看过之后别人做的改动。',
   parameters: {
     type: 'object',
     properties: {
@@ -144,15 +147,33 @@ const READ_TOOL = {
         lines: { type: 'integer' },
         offset: { type: 'integer' },
         returned: { type: 'integer' },
+        bytes: { type: 'integer' },
+        capped: { type: 'boolean' },
         truncated: { type: 'boolean' },
         content: { type: 'string' },
       },
-      required: ['path', 'version', 'size', 'lines', 'offset', 'returned', 'truncated', 'content'],
+      required: [
+        'path',
+        'version',
+        'size',
+        'lines',
+        'offset',
+        'returned',
+        'bytes',
+        'capped',
+        'truncated',
+        'content',
+      ],
       additionalProperties: false,
     },
     render(_args, value) {
       const last = value.offset + value.returned - 1
-      const tail = value.truncated ? '（后面还有，用 offset 继续）' : '（已到末尾）'
+      let tail
+      if (value.capped) {
+        tail = `（本次给到 ${(value.bytes / 1024).toFixed(1)}KB 就停下了，全文 ${value.size}B；要别的位置传 offset）`
+      } else {
+        tail = value.truncated ? '（后面还有，用 offset 继续）' : '（已到末尾）'
+      }
       const head = `# ${value.path} · ${value.size}B · 全文 ${value.lines} 行 · 版本 ${value.version} · 本次第 ${value.offset}–${last} 行 ${tail}`
       return [{ type: 'text', text: `${head}\n\n${value.content}` }]
     },
@@ -161,6 +182,137 @@ const READ_TOOL = {
     const abs = resolveTarget(args?.path)
     if (!existsSync(abs)) throw new Error(`文件不存在：${relPath(abs)}`)
     return read(abs, { offset: args?.offset, limit: args?.limit })
+  },
+}
+
+/* ---------------------------------------------------------------- recall */
+
+/**
+ * 召回工具。只读，不落盘，所以没有确认框，也不需要 expected_version。
+ *
+ * 它的价值全在返回格式上：给的是「路径:起-止行 + 版本 + 现成的 memory_read
+ * 参数」，让模型从「整份读 33KB」变成「读这 5 行」。所以 render 里必须把
+ * offset / limit 写出来 —— 否则模型拿到行号还是得自己算。
+ */
+export const RECALL_TOOL = {
+  name: 'memory_recall',
+  description:
+    '按关键词召回长期记忆里的相关片段（返回现成片段 + 文件路径 + 行号 + 版本号，不返回全文）。用户问"你还记得…吗""之前说过的…""我们定过什么"，或你准备说"没聊过这个"之前，直接用它——不必等用户点名要查。**它返回的片段通常已经够回答，看完直接答，不要再 memory_read 复读一遍**；只有片段被标了「截断」、或答案明显落在片段之外，才用返回的 offset 读那几行。任何情况下都不要整份 memory_read。存档层默认不参与，要翻旧版显式传 scope:"all"。',
+  parameters: {
+    type: 'object',
+    properties: {
+      query: {
+        type: 'string',
+        description:
+          '关键词或短语，越短越准。取问题里的**实体词**，不要拿整句去搜：「你还记得那次算缓存命中率的事吗」→ 查「缓存命中」。**一个词只查一次**——查了「底线测试」就别再串一个「底线」，后者是前者的前缀，返回的段六成重合（实测 1103/1769 字重复）；要换词，只在一条都没命中、或命中的明显不相关时才做。**但几个互不相干的词，要在同一条消息里并行发出几个 `memory_recall`**，不要一个个串着发：串行每多一步，整个上下文和这一步的推理都要重付一遍（实测同一件事，4 步串行 ¥0.30、并成 1 步约 ¥0.077）。',
+      },
+      limit: { type: 'integer', description: '返回几段，默认 3，上限 10' },
+      scope: {
+        type: 'string',
+        enum: ['live', 'all', 'inject', 'memory'],
+        description:
+          'live=现役（默认，不含 archive 和注入层——注入层每轮都在上下文里，召回它没有意义）；all=包含存档；inject=只查注入层；memory=只查记忆目录',
+      },
+    },
+    required: ['query'],
+    additionalProperties: false,
+  },
+  output: {
+    schema: {
+      type: 'object',
+      properties: {
+        query: { type: 'string' },
+        scope: { type: 'string' },
+        total: { type: 'integer' },
+        filtered: { type: 'integer' },
+        terms: { type: 'array', items: { type: 'string' } },
+        hits: {
+          type: 'array',
+          items: {
+            type: 'object',
+            properties: {
+              path: { type: 'string' },
+              layer: { type: 'string' },
+              title: { type: 'string' },
+              label: { type: 'string' },
+              startLine: { type: 'integer' },
+              endLine: { type: 'integer' },
+              hitLine: { type: 'integer' },
+              version: { type: 'string' },
+              coverage: { type: 'number' },
+              score: { type: 'number' },
+              truncated: { type: 'boolean' },
+              text: { type: 'string' },
+            },
+            required: [
+              'path',
+              'layer',
+              'title',
+              'label',
+              'startLine',
+              'endLine',
+              'hitLine',
+              'version',
+              'coverage',
+              'score',
+              'truncated',
+              'text',
+            ],
+            additionalProperties: false,
+          },
+        },
+        fallback: {
+          type: 'array',
+          items: {
+            type: 'object',
+            properties: {
+              path: { type: 'string' },
+              layer: { type: 'string' },
+              title: { type: 'string' },
+            },
+            required: ['path', 'layer', 'title'],
+            additionalProperties: false,
+          },
+        },
+      },
+      required: ['query', 'scope', 'total', 'filtered', 'terms', 'hits', 'fallback'],
+      additionalProperties: false,
+    },
+    render(_args, value) {
+      if (!value.hits.length) {
+        const rows = value.fallback.map((f) => {
+          const label = LAYER_LABEL[f.layer] ?? f.layer
+          return `${label}  ${f.path}  ·  ${f.title}`
+        })
+        const head = `没有命中「${value.query}」（候选 ${value.total} 段）。别硬凑 —— 下面是现役文件清单，挑一个 memory_read 或换个词再召回：`
+        return [{ type: 'text', text: [head, '', ...rows].join('\n') }]
+      }
+
+      const head = `命中 ${value.hits.length} 段 · 关键词「${value.query}」· 池 ${
+        value.scope === 'live' ? '现役' : value.scope
+      } · 过门槛 ${value.total} 段${value.filtered ? `（覆盖度不足剔除 ${value.filtered}）` : ''}\n下面每段都已含命中行，**够回答就直接答，不必再 memory_read**。`
+
+      const blocks = value.hits.map((hit, i) => {
+        const label = LAYER_LABEL[hit.layer] ?? hit.layer
+        const tag = hit.layer === 'archive' ? ' `[存档·已过时]`' : ''
+        const span = hit.endLine - hit.startLine + 1
+        const how = hit.truncated
+          ? `　（这段被截断了，要前后文再读：memory_read {"path":"${hit.path}","offset":${hit.startLine},"limit":${span}}）`
+          : `　（版本 ${hit.version} · 命中第 ${hit.hitLine} 行 · 片段完整，直接引用即可）`
+        return [
+          `#${i + 1} ${hit.path}:${hit.startLine}-${hit.endLine} · ${label}${tag} · 覆盖度 ${hit.coverage.toFixed(2)}`,
+          `　${hit.label}`,
+          how,
+          '',
+          hit.text,
+        ].join('\n')
+      })
+
+      return [{ type: 'text', text: [head, '', blocks.join('\n\n---\n\n')].join('\n') }]
+    },
+  },
+  async execute(args) {
+    return recall(args?.query, { limit: args?.limit ?? 3, scope: args?.scope ?? 'live' })
   },
 }
 
@@ -955,6 +1107,9 @@ function registerHttpBridge(ctx) {
 
 export function apply(ctx) {
   ctx.effect(() => ctx.skills.register(SKILL), 'memory-refine: protocol skill')
+  // 「什么时候该想起」不注册成 skill：skill 要先被加载才能读到正文，一次触发
+  // 多花一趟工具往返 + 一份协议全文，而且模型会为了「按规矩走」再决定一遍。
+  // 这条规则放注入层（静态、每轮可见、走缓存）成本几乎为零，也只有一个源。
 
   // 界面通道也遵守「注册失败不拖垮别的」。
   ctx.effect(() => {
@@ -984,6 +1139,7 @@ export function apply(ctx) {
   const tools = [
     ['memory_list', LIST_TOOL],
     ['memory_read', READ_TOOL],
+    ['memory_recall', RECALL_TOOL],
     ['memory_write', makeWriteTool(ctx)],
     ['memory_import', makeImportTool(ctx)],
     ['memory_gather', makeGatherTool(ctx)],

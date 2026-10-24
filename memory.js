@@ -116,13 +116,37 @@ export function list(scope = 'all') {
   return out.sort((a, b) => a.path.localeCompare(b.path))
 }
 
-/** 分页读。默认 250 行，上限 2000 行 —— 避免把 19KB 的记忆文件一次灌进上下文。 */
+/**
+ * 不传 limit 时的单次字节上限。
+ *
+ * 只按行数限量是拦不住的：我们的线.md 才 88 行，250 行的默认页等于一次倒完 33KB，
+ * 模型想"保守起见整份读"就会毫不犹豫这么干。行数管得住小文件、管不住这种
+ * "行少字多"的长段文件，所以这里再夹一道字节闸。
+ */
+const READ_MAX_BYTES = 8000
+
+/** 分页读。默认 250 行 / 8KB，上限 2000 行 —— 避免把 33KB 的记忆文件一次灌进上下文。 */
 export function read(abs, { offset, limit } = {}) {
   const text = readFileSync(abs, 'utf8')
   const all = text.split('\n')
   const start = Math.max(1, Number(offset) || 1)
-  const count = Math.max(1, Math.min(Number(limit) || 250, 2000))
-  const slice = all.slice(start - 1, start - 1 + count)
+  // 显式给了 limit 就按它来（说明确实要这么多行）；没给才夹字节
+  const explicit = Number(limit) > 0
+  const want = Math.max(1, Math.min(explicit ? Number(limit) : 250, 2000))
+
+  const slice = []
+  let bytes = 0
+  let capped = false
+  for (let i = start - 1; i < all.length && slice.length < want; i++) {
+    const cost = Buffer.byteLength(all[i], 'utf8') + 1
+    if (!explicit && slice.length > 0 && bytes + cost > READ_MAX_BYTES) {
+      capped = true
+      break
+    }
+    slice.push(all[i])
+    bytes += cost
+  }
+
   return {
     path: relPath(abs),
     version: hash(text),
@@ -130,6 +154,8 @@ export function read(abs, { offset, limit } = {}) {
     lines: all.length,
     offset: start,
     returned: slice.length,
+    bytes,
+    capped,
     truncated: start - 1 + slice.length < all.length,
     content: slice.join('\n'),
   }
