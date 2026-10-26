@@ -34,6 +34,49 @@ export function shortSessionId(sessionId) {
   return (raw.split('-')[0] || 'x').slice(0, 8)
 }
 
+/* ------------------------------------------------------- host-injected */
+
+/**
+ * 宿主注入事件的来源白名单。
+ *
+ * 依据（app.asar 内 `dsh-time-context/lib/index.js`）：注入插件用
+ * `createUserMessage({ source: { kind: <插件名>, form: 'snapshot' } })` 往事件流里
+ * 追加一条**独立的** user 消息。所以 source.kind 的值就是注入来源插件的名字，
+ * 而不是一个封闭枚举。
+ *
+ * 正因为它会随插件增减而变化，这里只做白名单匹配，**绝不做「不在白名单就丢」
+ * 的反向判断**：将来宿主接上新的正常来源时，反向判断会把真实消息当注入删掉，
+ * 而且不会报错 —— 只是那些话从此再也搜不到，是最难发现的一类故障。
+ */
+const HOST_INJECTED_KINDS = new Set(['time-context', 'runtime-context'])
+
+/** 取 source.kind；没有 source、不是对象、kind 不是字符串时一律返回 ''。 */
+function kindOfSource(source) {
+  return source && typeof source === 'object' && typeof source.kind === 'string' ? source.kind : ''
+}
+
+/**
+ * 这条事件是否属于宿主注入。
+ *
+ * 只看来源，不看正文长什么样 —— 正文可以被改写（`Time sampled` 换个措辞、
+ * 加个前缀），来源标记不会。
+ */
+export function isHostInjected(event) {
+  return HOST_INJECTED_KINDS.has(kindOfSource(event?.data?.source))
+}
+
+/**
+ * 整条丢弃的统一记账。user/message 与 agent/inbox/spliced 两条载体共用，
+ * 保证 droppedSystemMsg（总数）与 droppedBySource（细分）口径一致。
+ *
+ * 注意 droppedInjection 是**字符数**、这里是**条数**，两者不能混用：
+ * 按来源排除不产生任何字符剥离，所以不能顺手去加 droppedInjection。
+ */
+function dropInjected(stats, kind) {
+  stats.droppedSystemMsg++
+  if (kind) stats.droppedBySource[kind] = (stats.droppedBySource[kind] ?? 0) + 1
+}
+
 /* --------------------------------------------------------------- injection */
 
 /**
@@ -72,7 +115,7 @@ export function stripInjection(text) {
  * `agent/inbox/spliced` fallback — because skipping it on either one lets an
  * AGENTS.md update notice land in the material as if the user had typed it.
  */
-function cleanUserContent(content, stats) {
+export function cleanUserContent(content, stats) {
   if (!Array.isArray(content) || content.length === 0) {
     stats.droppedSystemMsg++
     return null
@@ -176,6 +219,7 @@ export function collectRecords(events) {
   const stats = {
     droppedInjection: 0,
     droppedSystemMsg: 0,
+    droppedBySource: {},
     emptyAssistant: 0,
     reasoningChars: 0,
     myTurns: 0,
@@ -189,6 +233,13 @@ export function collectRecords(events) {
     if (e.surfaceOp && typeof e.surfaceOp === 'object') stats.replacedSurface++
 
     if (e.type === 'user/message') {
+      // 先按来源排除宿主注入，再走文本清洗。顺序不能反：文本清洗只能认出
+      // 它认识的写法（system-reminder / Current runtime context.），换个措辞
+      // 就会漏；来源标记不会。
+      if (isHostInjected(e)) {
+        dropInjected(stats, kindOfSource(e.data?.source))
+        continue
+      }
       const cleaned = cleanUserContent(e.data?.content, stats)
       if (cleaned) {
         records.push({ kind: 'user', time: e.time, seq: e.seq, content: cleaned, id: e.data?.id })
@@ -228,6 +279,12 @@ export function collectRecords(events) {
       // Only a fallback for when no user/message event was recorded.
       for (const ins of e.data?.inserted ?? []) {
         if (ins?.role !== 'user') continue
+        // inserted[] 是否带 source 未经验证：有来源才按来源排，没来源不臆测。
+        const insKind = kindOfSource(ins.source)
+        if (HOST_INJECTED_KINDS.has(insKind)) {
+          dropInjected(stats, insKind)
+          continue
+        }
         const cleaned = cleanUserContent(ins.content, stats)
         if (!cleaned) continue
         records.push({ kind: 'user', time: e.time, seq: e.seq, content: cleaned, id: ins.id, viaSplice: true })

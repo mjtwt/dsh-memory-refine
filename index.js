@@ -3,11 +3,12 @@
  *
  * Two layers live here:
  *   1. a runtime skill carrying the refinement protocol (no disk effect);
- *   2. six tools: four are the only path through which this plugin can touch
+ *   2. seven tools: four are the only path through which this plugin can touch
  *      the user's memory files or the prompt-injection layer, one turns a
- *      session log into refinement material (read-only), and one is a
+ *      session log into refinement material (read-only), one is a
  *      read-only keyword recall that hands back line numbers instead of whole
- *      files (see search.js).
+ *      files (see search.js), and one searches the raw words of past sessions
+ *      (see history.js).
  *
  * The write path is deliberately paranoid, because the thing it edits is the
  * one file the user cannot regenerate. Every write goes through:
@@ -28,6 +29,7 @@ import {
 import { basename, isAbsolute, join, resolve } from 'node:path'
 import { PROTOCOL } from './protocol.js'
 import { deriveWatermark, gatherEvents, shortSessionId } from './gather.js'
+import { makeHistoryTool } from './history.js'
 import { recall } from './search.js'
 import {
   DSH_HOME,
@@ -695,8 +697,12 @@ function renderGather(_args, value) {
   if (value.empty) lines.push('⚠️ 边界之后没有新内容，素材是空的。')
   if (value.digestPath) lines.push(`工具调用摘要：${value.digestPath}`)
   lines.push(`水位线：${value.watermarkLine}`)
+  // 两种口径分开报，不合并成一个数：按来源排掉的条数本身就是「宿主这次注入
+  // 了多少次」的观测值，混进文本剥离里就看不出来了。
+  const bySource = Object.values(s.droppedBySource ?? {}).reduce((a, b) => a + (b ?? 0), 0)
+  const byText = Math.max(0, (s.droppedSystemMsg ?? 0) - bySource)
   lines.push(
-    `已丢弃：注入文本 ${s.droppedInjectionKB ?? 0}KB · 纯注入消息 ${s.droppedSystemMsg ?? 0} 条 · 推理 ${s.reasoningKB ?? 0}KB · request-header ${s.requestHeaderKB ?? 0}KB`,
+    `已丢弃：注入文本 ${s.droppedInjectionKB ?? 0}KB · 注入消息 ${s.droppedSystemMsg ?? 0} 条（按来源 ${bySource} · 文本识别 ${byText}）· 推理 ${s.reasoningKB ?? 0}KB · request-header ${s.requestHeaderKB ?? 0}KB`,
   )
   lines.push('', `预览（前 ${PREVIEW_CHARS} 字）：`, '', value.preview ?? '')
   return [{ type: 'text', text: lines.join('\n') }]
@@ -761,7 +767,7 @@ function makeGatherTool(ctx) {
   return {
     name: 'memory_gather',
     description:
-      '把一场会话的对话取成提炼素材（markdown 落盘）。会丢掉引擎注入的消息、消息内嵌的 system-reminder、request/header 提示词清单、运行时快照与推理正文，只留他说的话、我的回复和工具调用摘要。默认增量：从前一条 memory_gather 留下的水印之后接着取；水印写在素材首行，下次自动接上，所以不需要任何外部状态文件。只读会话日志，不碰记忆文件。',
+      '把一场会话的对话取成提炼素材（markdown 落盘）。按事件来源整条排除宿主注入：time-context（时间快照）、runtime-context（运行时上下文）；并对消息内嵌的 system-reminder 与 Current runtime context. 做文本剥离。未覆盖的来源（目前已知：goal、tool-goal、repeat-tool-reminder、user-approval）仍会进入素材，不要假设它们被清掉了。其余只留他说的话、我的回复和工具调用摘要。默认增量：从前一条 memory_gather 留下的水印之后接着取；水印写在素材首行，下次自动接上，所以不需要任何外部状态文件。只读会话日志，不碰记忆文件。',
     parameters: {
       type: 'object',
       properties: {
@@ -1143,6 +1149,7 @@ export function apply(ctx) {
     ['memory_write', makeWriteTool(ctx)],
     ['memory_import', makeImportTool(ctx)],
     ['memory_gather', makeGatherTool(ctx)],
+    ['memory_history', makeHistoryTool(ctx)],
   ]
   for (const [name, tool] of tools) {
     ctx.effect(() => {

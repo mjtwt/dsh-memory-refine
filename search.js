@@ -74,7 +74,7 @@ function stripComments(text) {
  * 只做 2-gram、不做 3–6 gram：query 和正文必须走同一套分词，否则 coverage 的
  * 分母会对不上（命中 2 个 bigram 却要除以 5 个 n-gram），长词反而搜不到。
  */
-function tokenize(text) {
+export function tokenize(text) {
   const out = []
   for (const m of text.matchAll(/[\u4e00-\u9fff]+|[A-Za-z][A-Za-z0-9_]*|\d+/g)) {
     const raw = m[0]
