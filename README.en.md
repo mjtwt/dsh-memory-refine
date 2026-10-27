@@ -6,6 +6,8 @@ A "memory refine" plugin for DSH (DeepSeek Harness): it distills a long conversa
 
 The other direction is covered too: **when it needs to "remember something from before", it never has to read a whole file.** A keyword recall returns a few passages with line numbers (one memory per passage, ~400 characters), in about 12 ms.
 
+"Remembering" turns out to have **two sources**, and they are not interchangeable: a distilled conclusion lives in a memory file, while what you actually said at the time lives in the session log. `memory_recall` reads the first, `memory_history` searches the second — because "we never refined it" is not the same as "we never talked about it". Which one to use, and when to stop, is written into the protocol (§10) rather than left to the model's judgement.
+
 > This is not a commercial product; it is something I built because I needed it. Take it if you want it. (MIT)
 > Every judgement it makes rests on one premise: long-term memory is something you confirmed by hand, not something the model accumulated on its own.
 
@@ -77,15 +79,16 @@ The plugin only handles *how to write safely*; **what to write** is still up to 
 
 ---
 
-## Six tools
+## Seven tools
 
-The plugin registers six model-callable tools, all of which only touch whitelisted files.
+The plugin registers seven model-callable tools, all of which only touch whitelisted files (`memory_history` touches no files at all — it only reads the session surface).
 
 | Tool | What it does |
 | --- | --- |
 | `memory_list` | Lists managed files: the injected layer `AGENTS.md`, the index, topic notes and the archive — with version hashes and line counts |
 | `memory_read` | Reads a managed file (paginated), returning its layer, version and total line count |
 | `memory_recall` | Recalls the few relevant passages for a keyword: returns `path:start-end`, version and the passage itself — never the whole file, and no extra read once it answers |
+| `memory_history` | Searches the **original words** of past sessions by keyword: returns session id + event seq + time + passage — never touches memory files |
 | `memory_gather` | Turns a session into refinement material, writes it to disk as markdown, returns a preview and statistics |
 | `memory_write` | Writes to a managed file. **Nothing lands until the user says yes** |
 | `memory_import` | Imports external content into a memory file (new section / append) |
@@ -113,6 +116,32 @@ One recall is capped at 2400 characters (≤5.7KB rendered). Acceptance script: 
 **Recall is deliberately not a skill.** A skill has to be loaded before its body is readable, which adds a tool round-trip and a full protocol dump per trigger; worse, the model re-derives the rule "to follow procedure" — observed in practice as "check the injected rule, decide whether to load the skill, then follow the skill", i.e. one decision made twice. One rule, one home. Recall output arrives as a tool result appended to the conversation, so the system prompt is never rewritten and the prefix cache stays warm.
 
 > Why no per-turn auto-injection: the host does expose a `system-prompt/assemble` hook, but inserting a variable section into the system prompt invalidates the prefix cache from that point on — in a long session that single turn can cost an order of magnitude more. Static rules belong in the injected layer `AGENTS.md`, where the content never changes and the cache always hits.
+
+### `memory_history`: the original words
+
+Memory files hold distilled conclusions; the session log holds what was actually said. Two datasets, two gates, and neither can stand in for the other.
+
+**When to use it** (only these three):
+
+- the user wants the original words or a date — "what exactly did I say", "when did we decide that";
+- `memory_recall` has nothing, but the user is sure it came up. **Not refined ≠ never discussed**;
+- the conclusion in memory contradicts itself or looks stale, and you need to go back to the source.
+
+**When not to**: `memory_recall` already hit, the passage is not marked truncated, and the user is asking for a conclusion — **answer and stop**. Stacking a second lookup on top is paying twice: one cold scan is seconds and an order of magnitude more work (measured on this machine: 29 sessions, 2967 indexed records, 2.5 s), and what it usually returns is the same thing phrased differently.
+
+**The hit count is not relevance.** Measured, not theorised: a real query came back saying `2/2 hits` — and that `2` is the **return limit**, not the number of relevant hits. One of them scored coverage **0.40**, barely over the 0.35 gate, and read "he finally, succeeded" — unrelated to the question, matched only on a few common words. Read each passage and check that it actually answers what was asked; never turn "there are results" into "we found it".
+
+Other rules:
+
+- **Current surface only.** Messages folded away by context compaction are not returned. That is intended: two versions of the same fact side by side make the result contradict itself, and the model would treat the recall as fact. To read folded-away text, expand it through the host's `readEvent` and **label it as the old version**.
+- **Host-injected events are dropped by source, not by wording.** Every turn, DSH writes its own `user/message` events (`data.source.kind` = `time-context` / `runtime-context`). They are dropped before any text cleanup — they are not things the user said. Measured in one session: 98 injected events out of 591, but **65.8% of the characters**. Text-level stripping (`<system-reminder>`, `Current runtime context.`) stays as a fallback; on its own it does not catch the newer event shapes.
+- **Excluded by default**: the session you are calling from. Pass `session_id` to search it anyway.
+- **Gates**: coverage below **0.35** is dropped (looser than recall's 0.5, because conversations are noisier); at most 2 hits per session; 200 characters per passage; the whole response obeys `max_chars` (default 1500, hard cap). A passage cut by the budget is marked `truncated: true`.
+- **`score` is for ordering, not confidence.**
+- **If both sides come back**: the conclusion in the memory file wins, the original words only fill in detail. When they disagree, say so — "you said this at the time, and later it became that" — **do not present an old quote as the current rule**.
+- **If neither finds anything**: say "I did not write this one down". `memory_history` only sees the current surface, so **its silence is not proof** that nothing was said.
+
+`memory_history` builds no index on disk and no vector store, and never reads `session.v4.jsonl.zstd`. It goes through the host's existing `ctx.sessionQuery`: `listSessions()` → `readSurface(id)` → reuse of `gather.js` extraction and `search.js` Chinese 2-gram tokenising, with its own BM25. Zero external dependencies, zero persistent state.
 
 ### `memory_gather` parameters
 
@@ -199,6 +228,7 @@ It reads DSH's session event stream directly (`sessionQuery.readSession`) and ne
 
 What gets dropped:
 
+- **host-injected events, by source** — DSH writes its own `user/message` events every turn (`data.source.kind` = `time-context` / `runtime-context`). Text-level stripping does not catch these newer shapes: measured on one session, 98 injected events out of 591, and they were **65.8% of the characters**. The whitelist is positive and closed on purpose — `kind` is a plugin name, not a fixed enum, so "anything not on the list gets dropped" would silently eat real messages;
 - entire `<system-reminder>` blocks (AGENTS.md change notices arrive this way, and are **the easiest thing to mistake for "something the user said"**);
 - bare runtime snapshots (everything after `Current runtime context.`);
 - the prompt list inside `request/header`;
@@ -222,14 +252,17 @@ On the next gathering, `deriveWatermark()` scans the session log's `tool/result`
 
 ```
 memory-refine/
-├── index.js        Host half: skill + 6 tools + the UI bridge
+├── index.js        Host half: skill + 7 tools + the UI bridge
 ├── client.js       Browser half: sidebar icon + main panel
 ├── gather.js       Pure functions: session event stream → refinement material (no cordis dependency, testable on its own)
+├── history.js      Session surface → records → inverted index + BM25 (backing memory_history; testable on its own)
 ├── memory.js       Managed-file access layer: whitelist + version hash + backup + read-back verification
 ├── protocol.js     The full refinement protocol (injected as a skill)
 ├── search.js       Pure functions: segmentation + tokenising + TF-IDF scoring (recall)
-├── test/recall.mjs Recall acceptance: runs against real memory data, read-only
-├── test/smoke.mjs  Offline smoke test: fake ctx + sandboxed DSH_HOME
+├── test/recall.mjs     Recall acceptance: runs against real memory data, read-only
+├── test/history.mjs    memory_history acceptance: coverage, gates, quota, budget, cache, refresh
+├── test/injection.mjs  Host-injection filtering: dropped by event source, not by wording
+├── test/smoke.mjs      Offline smoke test: fake ctx + sandboxed DSH_HOME
 ├── cordis.patch.yml Tells DSH which line to insert
 └── package.json
 ```
@@ -241,18 +274,25 @@ memory-refine/
 ## Tests
 
 ```
-node test/smoke.mjs
+node test/smoke.mjs      # host half, fake ctx, sandboxed DSH_HOME
+node test/history.mjs    # memory_history, fake sessionQuery
+node test/injection.mjs  # host injection dropped by event source
+node test/recall.mjs     # recall, against real memory data (read-only)
 ```
 
-No DSH process and no real memory files — it loads the host half with a fake `ctx`, points `DSH_HOME` at a sandbox in the OS temp directory, and removes it afterwards.
-
-20 assertions, aimed less at "does it work" and more at **the branches you cannot reach by clicking**:
+**`smoke.mjs`** — no DSH process and no real memory files: it loads the host half with a fake `ctx`, points `DSH_HOME` at a sandbox in the OS temp directory, and removes it afterwards. 20 assertions, aimed less at "does it work" and more at **the branches you cannot reach by clicking**:
 
 - The four gates: `POST` only (405), known sub-paths only (404), JSON only (415), trust rejection passed through unchanged (403)
 - Whitelist escape rejected (`../../etc/passwd`)
 - Writes: read-back verification passes, and a backup file really is created
 - **Aborts when the version is stale** (`deadbeefdeadbeef` → not a single byte written)
 - Import spacing, and the delete backup naming plus the "it really is gone" check
+
+**`history.mjs`** — 35 assertions against a fake `sessionQuery`: which event types are collected, the 0.35 coverage gate, the two-per-session quota, the `max_chars` budget (hard cap, plus the `truncated` flag), cache reuse, and `refresh` semantics — `sessions_scanned + sessions_from_cache + sessions_failed = sessions considered`, always.
+
+**`injection.mjs`** — 6 assertions on the one thing you cannot check by eye: host-injected events are dropped by `data.source.kind`, and both carriers (`user/message` and the `inserted[]` of `agent/inbox/spliced`) feed the same counters. Every injection carries a unique four-character marker, so a hit can only have come from the injection itself.
+
+**`recall.mjs`** — runs against real memory files, read-only. Its "one passage holds one memory" assertion currently **fails** on a real file where two entries sit on adjacent lines with no blank line between them. That is a content problem in the file, not a code defect, and the threshold was not lowered to make it pass.
 
 Producing those branches by hand means restarting DSH once per case. In the assertions they are three lines each.
 
@@ -275,4 +315,7 @@ Uninstalling **never** touches anything in `AGENTS.md` or `memory/`.
 
 - **The command channel is a fallback, not the main path.** The panel uses the plugin's own local HTTP route (`POST /memory-refine/ui`) by default and **does not go through the command bus**, so in normal use no `memory-refine · {...}` entry appears in the conversation view. Only when the route is unavailable does it fall back to the `/memory-refine` slash command, leaving a `command/run` / `command/done` pair — and then the panel shows a red warning telling you it degraded. Those events **never enter model history, never cost tokens, and never pollute the gathered material**.
 - The panel cannot determine the session id when **no session has ever been opened**; it asks you to open one first.
+- **`memory_history` cannot see folded-away history.** It reads the current surface only. That is by design — two versions of the same fact side by side would contradict each other — but it means "not found" is weaker evidence there than in a memory file. Say "I did not write this down", not "we never talked about it".
+- **Four injection sources still reach the index**: `goal`, `tool-goal`, `repeat-tool-reminder`, `user-approval`. Dropping them whole would lose real content (a `goal` event carries the actual objective in its body), so they are not filtered yet — do not assume they are clean.
+- **Counting is not yet deduplicated across carriers.** Injected events are checked both in `user/message` and in the `inserted[]` of `agent/inbox/spliced`. Measured today, no injected event arrives through the second path, so the totals are right; if the host ever starts putting them there, they would be counted twice.
 - Verified on **Windows** only.
