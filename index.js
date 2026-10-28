@@ -704,6 +704,14 @@ function renderGather(_args, value) {
   lines.push(
     `已丢弃：注入文本 ${s.droppedInjectionKB ?? 0}KB · 注入消息 ${s.droppedSystemMsg ?? 0} 条（按来源 ${bySource} · 文本识别 ${byText}）· 推理 ${s.reasoningKB ?? 0}KB · request-header ${s.requestHeaderKB ?? 0}KB`,
   )
+  // 名单外的来源一律放行，所以「出现了陌生的 kind」是这套过滤唯一的预警。
+  // 不报出来，那个记账就等于没有 —— 没人会去翻 stats 对象。
+  const strange = Object.entries(s.unknownKinds ?? {}).filter(([, n]) => n > 0)
+  if (strange.length) {
+    lines.push(
+      `⚠️ 名单外的来源：${strange.map(([k, n]) => `${k} ${n} 条`).join(' · ')} —— 已保留、未过滤。确认它确实是宿主注入后，加进 gather.js 的 INJECTED_KIND_LIST。`,
+    )
+  }
   lines.push('', `预览（前 ${PREVIEW_CHARS} 字）：`, '', value.preview ?? '')
   return [{ type: 'text', text: lines.join('\n') }]
 }
@@ -767,7 +775,7 @@ function makeGatherTool(ctx) {
   return {
     name: 'memory_gather',
     description:
-      '把一场会话的对话取成提炼素材（markdown 落盘）。按事件来源整条排除宿主注入：time-context（时间快照）、runtime-context（运行时上下文）；并对消息内嵌的 system-reminder 与 Current runtime context. 做文本剥离。未覆盖的来源（目前已知：goal、tool-goal、repeat-tool-reminder、user-approval）仍会进入素材，不要假设它们被清掉了。其余只留他说的话、我的回复和工具调用摘要。默认增量：从前一条 memory_gather 留下的水印之后接着取；水印写在素材首行，下次自动接上，所以不需要任何外部状态文件。只读会话日志，不碰记忆文件。',
+      '把一场会话的对话取成提炼素材（markdown 落盘）。按事件来源整条排除宿主注入：time-context（时间快照）、runtime-context（运行时上下文）、user-approval（批准提示）、repeat-tool-reminder（重复调用提醒）、tool-jobs（后台任务通知）；并对消息内嵌的 system-reminder 与 Current runtime context. 做文本剥离。goal 与 tool-goal 是有意保留的：它们写着这场在忙什么，删了提炼会缺上下文，但引用时别当成用户说的话。从没见过的来源一律保留，只在统计的 unknownKinds 里留个名字——宁可漏掉一次新注入，也不悄悄删掉用户真说的话。其余只留他说的话、我的回复和工具调用摘要。默认增量：从前一条 memory_gather 留下的水印之后接着取；水印写在素材首行，下次自动接上，所以不需要任何外部状态文件。只读会话日志，不碰记忆文件。',
     parameters: {
       type: 'object',
       properties: {

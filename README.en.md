@@ -135,6 +135,24 @@ Other rules:
 
 - **Current surface only.** Messages folded away by context compaction are not returned. That is intended: two versions of the same fact side by side make the result contradict itself, and the model would treat the recall as fact. To read folded-away text, expand it through the host's `readEvent` and **label it as the old version**.
 - **Host-injected events are dropped by source, not by wording.** Every turn, DSH writes its own `user/message` events (`data.source.kind` = `time-context` / `runtime-context`). They are dropped before any text cleanup — they are not things the user said. Measured in one session: 98 injected events out of 591, but **65.8% of the characters**. Text-level stripping (`<system-reminder>`, `Current runtime context.`) stays as a fallback; on its own it does not catch the newer event shapes.
+- **The two paths block different sources** (since 1.2.2):
+
+  | Source | Original words (`memory_history`) | Refinement material (`memory_gather`) |
+  |---|---|---|
+  | `time-context` (time snapshot) | drop | drop |
+  | `runtime-context` (runtime snapshot) | drop | drop |
+  | `user-approval` (approval prompt) | drop | drop |
+  | `repeat-tool-reminder` | drop | drop |
+  | `tool-jobs` (background job notice) | drop | drop |
+  | `agent-instructions` (AGENTS.md body) | drop | drop |
+  | `skill-catalog` | drop | drop |
+  | `goal` / `tool-goal` (objective) | **drop** | **keep** |
+  | no source / never seen before | keep | keep |
+
+  The last two (`agent-instructions`, `skill-catalog`) already sit inside `<system-reminder>` blocks and text stripping removes them cleanly (measured: 44 events / 281k characters, 23 / 45k, nothing left). They are still on the list so the result does not depend on **which tag they happen to be wrapped in** — blocking by source is certain, stripping by text is luck.
+
+  `goal` and `tool-goal` are split because the two paths want different things: searching for original words needs **what the user actually said**, and an objective summary is the host writing on the user's behalf (measured: 4 events, 3,037 characters, 759 on average — 15× the user's own average of 49). Refinement material needs **what this session was about**; drop them and you are left with two people talking about nothing in particular.
+- **Only named sources are blocked; everything else passes.** `source.kind` is a plugin name, not a fixed enum, so there is one "block these" list and anything off it is kept. Unknown kinds are recorded in `unknownKinds` in the statistics. The cost is that a newly added injection source gets through the first time — that count is the only warning you will get. The opposite approach ("not on the allowlist, therefore drop") silently eats real sources added later, and never reports it.
 - **Excluded by default**: the session you are calling from. Pass `session_id` to search it anyway.
 - **Gates**: coverage below **0.35** is dropped (looser than recall's 0.5, because conversations are noisier); at most 2 hits per session; 200 characters per passage; the whole response obeys `max_chars` (default 1500, hard cap). A passage cut by the budget is marked `truncated: true`.
 - **`score` is for ordering, not confidence.**
@@ -228,7 +246,7 @@ It reads DSH's session event stream directly (`sessionQuery.readSession`) and ne
 
 What gets dropped:
 
-- **host-injected events, by source** — DSH writes its own `user/message` events every turn (`data.source.kind` = `time-context` / `runtime-context`). Text-level stripping does not catch these newer shapes: measured on one session, 98 injected events out of 591, and they were **65.8% of the characters**. The whitelist is positive and closed on purpose — `kind` is a plugin name, not a fixed enum, so "anything not on the list gets dropped" would silently eat real messages;
+- **host-injected events, by source** — DSH writes its own `user/message` events every turn (`data.source.kind` = `time-context` / `runtime-context` / `user-approval` / `repeat-tool-reminder` / `tool-jobs` / `agent-instructions` / `skill-catalog`, plus `goal` / `tool-goal`). Text-level stripping does not catch these newer shapes: measured on one session, 98 injected events out of 591, and they were **65.8% of the characters**. Only named sources are blocked — `kind` is a plugin name, not a fixed enum, so "anything not on the list gets dropped" would silently eat real messages. `goal` / `tool-goal` are kept on this path because the material needs to know what the session was about;
 - entire `<system-reminder>` blocks (AGENTS.md change notices arrive this way, and are **the easiest thing to mistake for "something the user said"**);
 - bare runtime snapshots (everything after `Current runtime context.`);
 - the prompt list inside `request/header`;
@@ -290,9 +308,9 @@ node test/recall.mjs     # recall, against real memory data (read-only)
 
 **`history.mjs`** — 35 assertions against a fake `sessionQuery`: which event types are collected, the 0.35 coverage gate, the two-per-session quota, the `max_chars` budget (hard cap, plus the `truncated` flag), cache reuse, and `refresh` semantics — `sessions_scanned + sessions_from_cache + sessions_failed = sessions considered`, always.
 
-**`injection.mjs`** — 6 assertions on the one thing you cannot check by eye: host-injected events are dropped by `data.source.kind`, and both carriers (`user/message` and the `inserted[]` of `agent/inbox/spliced`) feed the same counters. Every injection carries a unique four-character marker, so a hit can only have come from the injection itself.
+**`injection.mjs`** — 10 assertions on the one thing you cannot check by eye: host-injected events are dropped by `data.source.kind`, both carriers (`user/message` and the `inserted[]` of `agent/inbox/spliced`) feed the same counters, and the two purposes (`history` / `gather`) block different sources. Every injection carries a unique four-character marker, so a hit can only have come from the injection itself; each "not found" assertion is also paired with a control that *must* be found, so a zero cannot be explained by tokenisation.
 
-**`recall.mjs`** — runs against real memory files, read-only. Its "one passage holds one memory" assertion currently **fails** on a real file where two entries sit on adjacent lines with no blank line between them. That is a content problem in the file, not a code defect, and the threshold was not lowered to make it pass.
+**`recall.mjs`** — runs against real memory files, read-only. Its "one passage holds one memory" assertion currently **fails** on a real file where two entries sit on adjacent lines with no blank line between them. That is a content problem in the file, not a code defect, and the threshold was not lowered to make it pass. Line numbers are no longer hard-coded (since 1.2.2 they are computed from the file each run), so adding a couple of lines to a memory file no longer turns three assertions red at once.
 
 Producing those branches by hand means restarting DSH once per case. In the assertions they are three lines each.
 
@@ -316,6 +334,7 @@ Uninstalling **never** touches anything in `AGENTS.md` or `memory/`.
 - **The command channel is a fallback, not the main path.** The panel uses the plugin's own local HTTP route (`POST /memory-refine/ui`) by default and **does not go through the command bus**, so in normal use no `memory-refine · {...}` entry appears in the conversation view. Only when the route is unavailable does it fall back to the `/memory-refine` slash command, leaving a `command/run` / `command/done` pair — and then the panel shows a red warning telling you it degraded. Those events **never enter model history, never cost tokens, and never pollute the gathered material**.
 - The panel cannot determine the session id when **no session has ever been opened**; it asks you to open one first.
 - **`memory_history` cannot see folded-away history.** It reads the current surface only. That is by design — two versions of the same fact side by side would contradict each other — but it means "not found" is weaker evidence there than in a memory file. Say "I did not write this down", not "we never talked about it".
-- **Four injection sources still reach the index**: `goal`, `tool-goal`, `repeat-tool-reminder`, `user-approval`. Dropping them whole would lose real content (a `goal` event carries the actual objective in its body), so they are not filtered yet — do not assume they are clean.
+- **`goal` / `tool-goal` depend on the purpose.** Kept for refinement material (you need to know what the session was about), dropped when searching original words (the host wrote them, the user did not). So for the same session the two tools can legitimately report different user-message counts — that is not a counting bug. Keeping them whole means the material contains host-voiced paragraphs; that is the known cost.
+- **Unknown sources are recorded, not blocked.** Any `kind` off the list passes through and its name lands in `unknownKinds`. When the host adds a new injection source it will get through once — that line is your only warning. See a strange name, add it to the list.
 - **Counting is not yet deduplicated across carriers.** Injected events are checked both in `user/message` and in the `inserted[]` of `agent/inbox/spliced`. Measured today, no injected event arrives through the second path, so the totals are right; if the host ever starts putting them there, they would be counted twice.
 - Verified on **Windows** only.

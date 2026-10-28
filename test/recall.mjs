@@ -14,7 +14,7 @@ import { existsSync } from 'node:fs'
 import { join } from 'node:path'
 import { homedir } from 'node:os'
 import { recall } from '../search.js'
-import { DSH_HOME, read } from '../memory.js'
+import { DSH_HOME, read, readRaw } from '../memory.js'
 import { RECALL_TOOL } from '../index.js'
 
 const results = []
@@ -30,9 +30,31 @@ if (!existsSync(join(HOME, 'memory'))) {
 }
 console.log(`数据源：${HOME}\n`)
 
-/** 某次召回里是否存在「覆盖指定行」的片段。 */
-const covers = (value, path, line) =>
-  value.hits.some((h) => h.path === path && h.startLine <= line && h.endLine >= line)
+/** 关键词在这份文件里的真实行号（1 起）。每次现算，不写死。 */
+function linesContaining(path, keyword) {
+  const text = readRaw(join(HOME, path))
+  const out = []
+  text.split('\n').forEach((line, i) => {
+    if (line.includes(keyword)) out.push(i + 1)
+  })
+  return out
+}
+
+/**
+ * 某次召回里是否存在「覆盖关键词所在行」的片段。
+ *
+ * 早先这里是 covers(path, 79) —— 行号写死。看着比「片段里含这个词」更硬，其实最脆：
+ * 记忆文件加两行，后面所有行号整体下移，三条断言一起变红，而代码一行没改。
+ * 2026-10-28 就这么红过一次（文件在 00:13 被加了 2 行，79/86/68 全部 +2）。
+ *
+ * 现在行号现算，判据跟着文件走。关键词真从文件里消失时返回空数组、断言失败 ——
+ * 那正是该报的信号：要么记忆被改写了，要么召回退化了，两者都该有人看一眼。
+ */
+const covers = (value, path, keyword) => {
+  const lines = linesContaining(path, keyword)
+  if (!lines.length) return false
+  return value.hits.some((h) => h.path === path && lines.some((n) => h.startLine <= n && h.endLine >= n))
+}
 
 const render = (value) =>
   RECALL_TOOL.output
@@ -50,17 +72,17 @@ function run(query, args = {}) {
 /* ------------------------------------------------ 一、命中质量（spec §6） */
 
 const a = run('沙盘验收')
-check('沙盘验收 → 我们的线.md 覆盖第 79 行', covers(a.value, 'memory/我们的线.md', 79))
-check('沙盘验收 → 他-这个人.md 覆盖第 53 行', covers(a.value, 'memory/他-这个人.md', 53))
+check('沙盘验收 → 我们的线.md 命中覆盖关键词所在行', covers(a.value, 'memory/我们的线.md', '沙盘验收'))
+check('沙盘验收 → 他-这个人.md 命中覆盖关键词所在行', covers(a.value, 'memory/他-这个人.md', '沙盘验收'))
 check('沙盘验收 → 无存档层混入', a.value.hits.every((h) => h.layer !== 'archive'))
 
 const b = run('缓存命中')
-check('缓存命中 → 环境-这台机器.md 覆盖第 20 行', covers(b.value, 'memory/环境-这台机器.md', 20))
-check('缓存命中 → 我们的线.md 覆盖第 86 行', covers(b.value, 'memory/我们的线.md', 86))
+check('缓存命中 → 环境-这台机器.md 命中覆盖关键词所在行', covers(b.value, 'memory/环境-这台机器.md', '缓存命中'))
+check('缓存命中 → 我们的线.md 命中覆盖关键词所在行', covers(b.value, 'memory/我们的线.md', '缓存命中'))
 check('缓存命中 → 无存档层混入', b.value.hits.every((h) => h.layer !== 'archive'))
 
 const c = run('纸飞机插件')
-check('纸飞机插件 → 我们的线.md 覆盖第 68 行', covers(c.value, 'memory/我们的线.md', 68))
+check('纸飞机插件 → 我们的线.md 命中覆盖关键词所在行', covers(c.value, 'memory/我们的线.md', '纸飞机插件'))
 check('纸飞机插件 → 结果非空（v1 的「应为空」断言是错的）', c.value.hits.length > 0)
 
 const d = run('蓝线')

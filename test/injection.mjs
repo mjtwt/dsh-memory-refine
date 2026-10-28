@@ -14,11 +14,20 @@
  *   蓝鲸回声 = 只出现在应保留的真实消息里，必须命中
  *   橙花回声 = 只出现在「未知来源」的应保留消息里，必须命中
  *   灰鹭低语 = 只出现在 spliced 载体里被过滤的条目，必须 0 命中
+ *   苍山墨玉 = goal 正文（查原话要 0 命中；取素材要保留）
+ *   白鹿衔枝 = tool-goal 正文（同上）
+ *   赤陶小印 = user-approval 正文（两条路都要 0 命中）
+ *   青石苔痕 = repeat-tool-reminder 正文（两条路都要 0 命中）
+ *   砂金耳坠 = tool-jobs 正文（两条路都要 0 命中）
+ *
+ * 零命中必须能被反证：每条「搜不到」的断言前面，先用 tokenize() 确认这个词
+ * 切得出来。否则「切不出词」和「被过滤掉」在结果上一样，测试就成了摆设。
  */
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import { collectRecords, gatherEvents } from '../gather.js'
 import { makeHistoryTool } from '../history.js'
+import { tokenize } from '../search.js'
 
 /* ------------------------------------------------------------------ 夹具 */
 
@@ -29,6 +38,11 @@ const INJ = '紫电鸮鸣'
 const REAL = '蓝鲸回声'
 const FUTURE = '橙花回声'
 const SPLICE = '灰鹭低语'
+const GOAL = '苍山墨玉'
+const TOOLGOAL = '白鹿衔枝'
+const APPROVAL = '赤陶小印'
+const REPEAT = '青石苔痕'
+const JOBS = '砂金耳坠'
 
 /** 真实用户消息：没有 source 字段（和真实数据里 kind:'user' 之外的普通情形一致）。 */
 const user = (seq, text) => ({
@@ -233,4 +247,129 @@ test('T29 spliced 载体：有来源才记账，没来源不臆测', async () =>
     stats.droppedSystemMsg,
     '细分之和必须等于总数（两条载体口径一致）',
   )
+})
+
+/* ------------------------------------------------------------------ T30 */
+
+test('T30 goal / tool-goal：查原话时排除，取素材时保留', async () => {
+  const events = [
+    user(1, `我要查的是${REAL}`),
+    sourced(2, 'goal', `${GOAL} 这场的目标是把过滤口径拆开`),
+    sourced(3, 'tool-goal', `${TOOLGOAL} 工具侧的目标说明`),
+    assistant(4, '好'),
+  ]
+
+  // 反证前提：这两个词切得出来。否则「零命中」和「根本切不出词」结果一样，
+  // 后面的断言就成了摆设。
+  assert.ok(tokenize(GOAL).length > 0, `${GOAL} 必须能被切词`)
+  assert.ok(tokenize(TOOLGOAL).length > 0, `${TOOLGOAL} 必须能被切词`)
+
+  // ① 取素材：都留着 —— 删了提炼时就不知道这场在忙什么
+  const material = collectRecords(events)
+  assert.equal(material.records.filter((r) => r.kind === 'user').length, 3, 'gather 口径保留 goal / tool-goal')
+  assert.equal(material.stats.droppedSystemMsg, 0, 'gather 口径不丢这两类')
+
+  // ② 查原话：只留真实那条 —— 宿主替用户写的摘要不是用户说的话
+  const dialog = collectRecords(events, { purpose: 'history' })
+  assert.equal(dialog.records.filter((r) => r.kind === 'user').length, 1, 'history 口径只留真实那条')
+  assert.equal(dialog.stats.droppedBySource.goal, 1, 'goal 要记账')
+  assert.equal(dialog.stats.droppedBySource['tool-goal'], 1, 'tool-goal 要记账')
+
+  // ③ 检索层：同一份事件，目标正文搜不到，真实内容搜得到
+  const tool = makeTool(
+    makeFakeQuery([{ id: 'session-aaaa1111', createdAt: new Date(T0).toISOString(), live: false, events }]),
+  )
+  assert.equal((await run(tool, { query: GOAL })).total_hits, 0, `${GOAL} 是宿主写的目标，不该被当原话搜到`)
+  assert.equal((await run(tool, { query: TOOLGOAL })).total_hits, 0, `${TOOLGOAL} 同理`)
+  assert.equal((await run(tool, { query: REAL })).total_hits, 1, '真实内容必须还能搜到')
+
+  // ④ 素材层：目标正文确实留在素材里 —— 这是③零命中的对照，证明过滤按用途走
+  const out = gatherEvents(events, { sessionId: 'session-aaaa1111', mode: 'full' })
+  assert.ok(out.markdown.includes(GOAL), '素材里必须有目标正文')
+  assert.ok(out.markdown.includes(TOOLGOAL), '素材里必须有工具目标正文')
+
+  // ⑤ 反证：同样一段文字，只把来源换成 user，就该搜得到。这样③的零命中
+  //    只能归因于来源标记，不能归因于文字本身（切不出词、覆盖度不够都不成立）。
+  const control = [user(1, `我要查的是${REAL}`), user(2, `${GOAL} 同一段字，来源换成 user`)]
+  const controlTool = makeTool(
+    makeFakeQuery([{ id: 'session-bbbb2222', createdAt: new Date(T0).toISOString(), live: false, events: control }]),
+  )
+  assert.equal((await run(controlTool, { query: GOAL })).total_hits, 1, '同样的字换成 user 来源就该搜到')
+})
+
+/* ------------------------------------------------------------------ T31 */
+
+test('T31 批准提示 / 重复提醒 / 后台通知：查原话时同样排除', async () => {
+  const cases = [
+    ['user-approval', APPROVAL],
+    ['repeat-tool-reminder', REPEAT],
+    ['tool-jobs', JOBS],
+  ]
+  const events = [user(1, `我要查的是${REAL}`)]
+  cases.forEach(([kind, mark], i) => {
+    events.push(sourced(i + 2, kind, `${mark} 宿主生成的提示正文`))
+    assert.ok(tokenize(mark).length > 0, `${mark} 必须能被切词`)
+  })
+
+  const { records, stats } = collectRecords(events, { purpose: 'history' })
+  assert.equal(records.filter((r) => r.kind === 'user').length, 1, '三类都不该留下')
+  for (const [kind] of cases) assert.equal(stats.droppedBySource[kind], 1, `${kind} 要记账`)
+
+  const tool = makeTool(
+    makeFakeQuery([{ id: 'session-aaaa1111', createdAt: new Date(T0).toISOString(), live: false, events }]),
+  )
+  for (const [, mark] of cases) {
+    assert.equal((await run(tool, { query: mark })).total_hits, 0, `${mark} 不该被当原话搜到`)
+  }
+})
+
+/* ------------------------------------------------------------------ T32 */
+
+test('T32 取素材时这三类也丢掉，但 goal 留下', async () => {
+  const events = [
+    user(1, `我要查的是${REAL}`),
+    sourced(2, 'goal', `${GOAL} 这场的目标`),
+    sourced(3, 'user-approval', `${APPROVAL} 批准提示`),
+    sourced(4, 'repeat-tool-reminder', `${REPEAT} 重复调用提醒`),
+    sourced(5, 'tool-jobs', `${JOBS} 后台任务完成`),
+    sourced(6, 'some-future-kind', `${FUTURE} 名单外的来源`),
+    assistant(7, '好'),
+  ]
+
+  const out = gatherEvents(events, { sessionId: 'session-aaaa1111', mode: 'full' })
+  assert.ok(out.markdown.includes(GOAL), '目标正文要留')
+  assert.ok(out.markdown.includes(FUTURE), '名单外的来源要留（宁可漏一次新注入，也不误删真话）')
+  for (const mark of [APPROVAL, REPEAT, JOBS]) {
+    assert.ok(!out.markdown.includes(mark), `${mark} 不该进素材`)
+  }
+  assert.equal(out.stats.droppedBySource['user-approval'], 1)
+  assert.equal(out.stats.droppedBySource['repeat-tool-reminder'], 1)
+  assert.equal(out.stats.droppedBySource['tool-jobs'], 1)
+  // 统计必须透到渲染层：index.js 的 renderGather 靠这个字段提示「出现了名单外的来源」，
+  // 透不出去，这套过滤就再也没有预警了。
+  assert.equal(out.stats.unknownKinds['some-future-kind'], 1, '陌生来源要能从 gatherEvents 的 stats 里读到')
+})
+
+/* ------------------------------------------------------------------ T33 */
+
+test('T33 两种口径都满足「细分之和 = 总数」，陌生来源留痕', async () => {
+  const events = [
+    user(1, `我要查的是${REAL}`),
+    sourced(2, 'time-context', '时间快照'),
+    sourced(3, 'goal', '这一场的目标'),
+    sourced(4, 'user-approval', '批准提示'),
+    sourced(5, 'some-future-kind', `${FUTURE} 还没见过的来源`),
+  ]
+
+  const counts = {}
+  for (const purpose of ['gather', 'history']) {
+    const { stats } = collectRecords(events, { purpose })
+    const sum = Object.values(stats.droppedBySource).reduce((a, b) => a + b, 0)
+    assert.equal(sum, stats.droppedSystemMsg, `${purpose}：细分之和必须等于总数`)
+    assert.equal(stats.unknownKinds['some-future-kind'], 1, `${purpose}：陌生来源要被记下来，这是唯一的预警`)
+    counts[purpose] = stats.droppedSystemMsg
+  }
+  // gather 拦 time-context + user-approval = 2；history 多拦一个 goal = 3
+  assert.equal(counts.gather, 2, 'gather 只拦两类')
+  assert.equal(counts.history, 3, 'history 多拦 goal')
 })

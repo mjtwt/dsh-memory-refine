@@ -151,7 +151,25 @@ DSH（DeepSeek Harness）的「记忆提炼」插件：把一场长对话提炼�
 
 其他几条口径：
 
-- **收录面**：只收 `user/message` 与 `assistant/message` 的 `text` 块。`reasoning` 一律丢（推理不是原话），`system/message`、`developer/message`、`tool/result`、`tool/call` 全部不收。用户消息先按**事件来源**整条排除宿主注入（`data.source.kind` 为 `time-context` / `runtime-context`），再对消息内嵌的 `<system-reminder>` 与 `Current runtime context.` 做文本剥离——**注入不是你说的话**。未覆盖的来源（`goal`、`tool-goal`、`repeat-tool-reminder`、`user-approval`）目前仍会进入结果，别假设它们被清掉了。
+- **收录面**：只收 `user/message` 与 `assistant/message` 的 `text` 块。`reasoning` 一律丢（推理不是原话），`system/message`、`developer/message`、`tool/result`、`tool/call` 全部不收。用户消息先按**事件来源**整条排除宿主注入，再对消息内嵌的 `<system-reminder>` 与 `Current runtime context.` 做文本剥离——**注入不是你说的话**。
+- **两条路拦的不是同一批来源**（1.2.2 起）：
+
+  | 来源 | 查原话（`memory_history`） | 取素材（`memory_gather`） |
+  |---|---|---|
+  | `time-context` 时间快照 | 丢 | 丢 |
+  | `runtime-context` 运行时上下文 | 丢 | 丢 |
+  | `user-approval` 批准提示 | 丢 | 丢 |
+  | `repeat-tool-reminder` 工具提醒 | 丢 | 丢 |
+  | `tool-jobs` 后台任务通知 | 丢 | 丢 |
+  | `agent-instructions` AGENTS.md 正文 | 丢 | 丢 |
+  | `skill-catalog` 技能目录 | 丢 | 丢 |
+  | `goal` / `tool-goal` 目标摘要 | **丢** | **留** |
+  | 没有来源标记 / 从没见过的 | 留 | 留 |
+
+  后两类（`agent-instructions`、`skill-catalog`）的正文本来就裹在 `<system-reminder>` 里，文本剥离也能剥干净（实测 44 条 28 万字、23 条 4.5 万字，一条不剩）。仍然写进名单，是为了不依赖「它裹在哪个标签里」这个前提——按来源拦是确定的，靠文本剥是碰巧。
+
+  `goal` 与 `tool-goal` 分开处理的原因：查原话要的是**用户亲口说的话**，目标摘要是宿主替用户写的（实测 4 条共 3,037 字、均长 759，是用户原话均长 49 字的 15 倍）；但取素材要知道**这场在忙什么**，删了就只剩两人对话、看不出上下文。
+- **只点名拦，不反向删**：`source.kind` 的值是注入来源插件的名字，不是封闭枚举。所以只维护一份"要拦谁"的名单，名单外的**一律保留**，陌生的 kind 记进统计的 `unknownKinds`。代价是新注入类第一次会漏，但那点痕迹是唯一的预警；反过来的做法（不在白名单就丢）会把将来新增的正常来源悄悄删掉，还不报错。
 - **门槛**：覆盖率（命中的查询词 / 查询词总数）低于 **0.35** 直接丢。会话语料比记忆文件杂，所以比 `memory_recall` 的 0.5 松；但也**不会为了「有结果」降到 0.35 以下**，一条没中就是没有。若存在覆盖率 ≥ 0.2 的候选，会在 `note` 里告诉你「最接近的只有 X」，那是让你换词，不是让你拿它顶替。
 - **配额**：每场会话最多 2 条，防止一场长会话霸榜。`score` 只用于排序，**不是可信度**——工具描述里也是这么写的，别把它当「把握多大」。
 - **预算**：单条原文 ≤ 200 字，单次正文总量 ≤ `max_chars`（默认 1500）。预算按「先命中的正文、再上文、最后下文」分配：正文字数按排名累加，见底就停——**总量绝不超**；被预算卡住的那一条会被截短（`truncated: true`），再往后的命中干脆不返回，`total_hits` 仍然如实报总数。
@@ -178,7 +196,7 @@ DSH（DeepSeek Harness）的「记忆提炼」插件：把一场长对话提炼�
 
 **为什么不用 DSH 自带的全文检索**：本部署的 `session-query-sqlite` 是 `openAt: never`（刻意关掉的），调用只会拿到 `SESSION_QUERY_SEARCH_DISABLED`；而且它的 tokenizer 是 `unicode61`，按 token 匹配而不是任意子串（`AI` 匹配不到 `BRAID`），中文召回很差。开不开都不该依赖它。
 
-单元测试：`node --test test/history.mjs`（35 条，注入假 `sessionQuery`，不碰真实数据）；注入过滤单独一份 `test/injection.mjs`（6 条，T24–T29），两份都不碰真实记忆文件。
+单元测试：`node --test test/history.mjs`（35 条，注入假 `sessionQuery`，不碰真实数据）；注入过滤单独一份 `test/injection.mjs`（10 条，T24–T33），两份都不碰真实记忆文件。
 
 ---
 
@@ -253,6 +271,7 @@ POST /memory-refine/ui          ← 面板的每一次操作都走这里
 
 丢弃的东西：
 
+- **按来源整条排除的宿主事件**：`time-context`、`runtime-context`、`user-approval`、`repeat-tool-reminder`、`tool-jobs`、`agent-instructions`、`skill-catalog`。它们每轮都以 `user/message` 的身份写进来，长得和用户发言一模一样，换过措辞的新形态靠文本剥不掉。`goal` / `tool-goal` 在这条路上**有意保留**（素材要知道这场在忙什么），查原话那条路会拦——见上文对照表；
 - `<system-reminder>` 整块（AGENTS.md 变更通知就是这么进来的，**最容易被当成「他说的」**）；
 - 裸运行时快照（`Current runtime context.` 之后的全部）；
 - `request/header` 里的提示词清单；
@@ -308,7 +327,9 @@ node --test "test/*.mjs"
 | `test/history.mjs` | `memory_history` 的收录面、门槛、配额、预算、缓存与 `refresh` | 否（假 `sessionQuery`） |
 | `test/recall.mjs` | 召回质量与非功能约束 | **是**（读真实记忆文件，只读；`~/.dsh` 下没有 `memory/` 就跳过） |
 
-> `test/recall.mjs` 的断言绑的是真实记忆文件的形状（比如「一行一条记忆」），所以**记忆文件本身一改，它就可能变红**——那不是插件坏了，是数据漂移。遇到先看它报的是哪一条、对应哪一行，别去调门槛。
+> `test/recall.mjs` 的断言绑的是真实记忆文件的形状，所以**记忆文件本身一改，它就可能变红**——那不是插件坏了，是数据漂移。遇到先看它报的是哪一条、对应哪一行，别去调门槛。
+>
+> 1.2.2 起行号不再写死：改成读文件现算关键词落在第几行（`linesContaining()`）。以前写死 `79 / 86 / 68`，文件加两行就三条一起红；现在文件怎么增删都跟着走，只有关键词真从文件里消失才会报。剩下的脆弱点只有「一行一条记忆」那一条，它验的是条目之间有没有空行 —— 那确实是文件内容问题。
 
 冒烟测试 20 条断言，重点不在「功能能跑」，而在**手动点不出来的那些分支**：
 
@@ -349,5 +370,6 @@ node --test "test/*.mjs"
 - **`memory_history` 的耗时只有一次实测，不是基准。** 本机冷扫 29 场 / 2967 条索引 / 2557ms（2026-10-27，一次观测）。分词 + 倒排 + 打分在 62 万字规模是 0.1 秒量级（CPU 侧微基准），瓶颈在 `readSurface` 背后的全量读盘 + 回放校验，而那条路径在插件进程外没有入口、测不了。所以工具描述里不承诺任何耗时，返回里的 `elapsed_ms` 才是每次自己的实测值；同一份 README 也不写「1 秒内」这种话。
 - **`memory_history` 看不到被压缩掉的历史。** 这是设计如此，不是缺陷：它只读当前表层。要旧原文得走宿主的 `readEvent`。也因此它说「没搜到」比记忆文件说「没记过」更弱 —— 别把它的沉默当成「没聊过」。
 - **注入事件在两条路上都会被检查，但计数没去重。** `user/message` 与 `agent/inbox/spliced` 的 `inserted[]` 各查一次。2026-10-27 实测 497/497 条 `inserted` 都带 source、且没有注入 kind，所以统计是对的；**若宿主将来把注入事件放进 `inserted`，会出现重复计数**。
-- **四类注入来源仍未过滤**：`goal`、`tool-goal`、`repeat-tool-reminder`、`user-approval`。整条删会丢真实内容（`goal` 正文里有 `Objective:`），所以暂时留着 —— 别假设它们干净。
+- **`goal` / `tool-goal` 进不进，取决于用途。** 取素材时保留（要知道这场在忙什么），查原话时排除（那是宿主替用户写的，不是用户的话）。所以对同一段会话，两个工具看到的"用户消息"条数本来就可以不同，这不是计数错。整条保留意味着素材里会出现宿主口吻的段落，是已知代价。
+- **陌生来源只留痕，不拦。** 名单外的 `kind` 一律放行，名字记进统计的 `unknownKinds`。宿主将来新增注入类时，第一次会漏进来——那行统计是唯一的预警，看到陌生名字就把它加进名单。
 - 只在 **Windows** 上验证过。

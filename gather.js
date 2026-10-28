@@ -48,21 +48,75 @@ export function shortSessionId(sessionId) {
  * 的反向判断**：将来宿主接上新的正常来源时，反向判断会把真实消息当注入删掉，
  * 而且不会报错 —— 只是那些话从此再也搜不到，是最难发现的一类故障。
  */
-const HOST_INJECTED_KINDS = new Set(['time-context', 'runtime-context'])
+const INJECTED_KIND_LIST = [
+  'time-context',
+  'runtime-context',
+  'goal',
+  'tool-goal',
+  'user-approval',
+  'repeat-tool-reminder',
+  'tool-jobs',
+  // 这两类正文目前都裹在 <system-reminder> 里，文本剥离本来也能剥干净（实测
+  // agent-instructions 44 条 28 万字、skill-catalog 23 条 4.5 万字，一条不剩）。
+  // 仍然写进名单，是为了不依赖"裹在哪个标签里"这个前提：按来源拦是确定的，
+  // 文本剥是碰巧。顺带让 unknownKinds 恢复成真正的"从没见过"。
+  'agent-instructions',
+  'skill-catalog',
+]
+
+/** 全部已知的非用户来源。用来区分「已知但这次放行」和「从没见过的」。 */
+const KNOWN_KINDS = new Set(['user', ...INJECTED_KIND_LIST])
+
+/**
+ * 查原话要拦的：全部九类。
+ *
+ * goal / tool-goal 在这里也必须拦 —— 那是宿主替用户写的目标摘要，不是用户说的话。
+ * 实测（31 场）4 条共 3,037 字、均长 759，是用户原话均长（49 字）的 15 倍；
+ * 放进「原话」里就是一整段别人的话冒充用户。
+ */
+const BLOCKED_FOR_HISTORY = new Set(INJECTED_KIND_LIST)
+
+/**
+ * 取提炼素材时要拦的：扣掉 goal / tool-goal。
+ *
+ * 这两类留着，是因为素材要回答「这场在忙什么」。只留两人对话，提炼出来会缺上下文。
+ * 其余五类（批准提示、工具提醒、后台通知、AGENTS.md 正文、技能目录）对提炼没用，仍然拦。
+ */
+const BLOCKED_FOR_GATHER = new Set(INJECTED_KIND_LIST.filter((k) => k !== 'goal' && k !== 'tool-goal'))
 
 /** 取 source.kind；没有 source、不是对象、kind 不是字符串时一律返回 ''。 */
 function kindOfSource(source) {
   return source && typeof source === 'object' && typeof source.kind === 'string' ? source.kind : ''
 }
 
+function blockedKinds(purpose) {
+  return purpose === 'history' ? BLOCKED_FOR_HISTORY : BLOCKED_FOR_GATHER
+}
+
 /**
- * 这条事件是否属于宿主注入。
+ * 这条事件的来源在某个用途下要不要整条丢。
  *
  * 只看来源，不看正文长什么样 —— 正文可以被改写（`Time sampled` 换个措辞、
  * 加个前缀），来源标记不会。
  */
-export function isHostInjected(event) {
-  return HOST_INJECTED_KINDS.has(kindOfSource(event?.data?.source))
+export function isHostInjected(event, purpose = 'gather') {
+  const kind = kindOfSource(event?.data?.source)
+  return kind !== '' && blockedKinds(purpose).has(kind)
+}
+
+/**
+ * 来源归一：keep 还是 drop。顺手把「从没见过的来源」记账。
+ *
+ * 记账不是统计好玩，是这套办法唯一的预警：只能点名拦，新来源第一次一定放行，
+ * 唯一能被发现的痕迹就是这里多出一个陌生名字。
+ */
+function classifySource(source, purpose, stats) {
+  const kind = kindOfSource(source)
+  if (!kind) return 'keep' // 没有来源标记：不臆测，放行
+  if (kind === 'user') return 'keep'
+  if (blockedKinds(purpose).has(kind)) return 'drop'
+  if (!KNOWN_KINDS.has(kind)) stats.unknownKinds[kind] = (stats.unknownKinds[kind] ?? 0) + 1
+  return 'keep'
 }
 
 /**
@@ -215,11 +269,21 @@ export function deriveWatermark(events, options = {}) {
 
 /* ----------------------------------------------------------------- records */
 
-export function collectRecords(events) {
+/**
+ * @param events 事件流
+ * @param options.purpose 'gather'（默认，取提炼素材）| 'history'（查原话）
+ *
+ * 两种用途拦的不是同一批来源：查原话时 goal / tool-goal 也要拦（宿主写的目标
+ * 摘要不是用户的话），取素材时反而要留（否则不知道这场在忙什么）。机制共用，
+ * 名单分开。
+ */
+export function collectRecords(events, options = {}) {
+  const purpose = options.purpose === 'history' ? 'history' : 'gather'
   const stats = {
     droppedInjection: 0,
     droppedSystemMsg: 0,
     droppedBySource: {},
+    unknownKinds: {},
     emptyAssistant: 0,
     reasoningChars: 0,
     myTurns: 0,
@@ -236,7 +300,7 @@ export function collectRecords(events) {
       // 先按来源排除宿主注入，再走文本清洗。顺序不能反：文本清洗只能认出
       // 它认识的写法（system-reminder / Current runtime context.），换个措辞
       // 就会漏；来源标记不会。
-      if (isHostInjected(e)) {
+      if (classifySource(e.data?.source, purpose, stats) === 'drop') {
         dropInjected(stats, kindOfSource(e.data?.source))
         continue
       }
@@ -280,9 +344,8 @@ export function collectRecords(events) {
       for (const ins of e.data?.inserted ?? []) {
         if (ins?.role !== 'user') continue
         // inserted[] 是否带 source 未经验证：有来源才按来源排，没来源不臆测。
-        const insKind = kindOfSource(ins.source)
-        if (HOST_INJECTED_KINDS.has(insKind)) {
-          dropInjected(stats, insKind)
+        if (classifySource(ins.source, purpose, stats) === 'drop') {
+          dropInjected(stats, kindOfSource(ins.source))
           continue
         }
         const cleaned = cleanUserContent(ins.content, stats)

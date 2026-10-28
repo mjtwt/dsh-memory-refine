@@ -134,10 +134,15 @@ function textOfContent(content) {
  * 注意：喂给它的必须是 readSurface().events。表层里本来就没有 tool/call 和
  * agent/inbox/spliced，所以 collectRecords 的那两个分支不会命中、viaSplice
  * 恒为 false —— 这不是 bug，是选 readSurface 的附带好处（同一条用户消息不会
- * 因为双载体被索引两遍）。不要为了「兼容」去改 collectRecords。
+ * 因为双载体被索引两遍）。
+ *
+ * purpose:'history' 是本函数唯一对 collectRecords 的额外要求：它让 goal /
+ * tool-goal 这类「宿主替用户写的目标摘要」也被排除。取素材那条路要留着它们
+ * （否则提炼时不知道这场在忙什么），查原话这条路不能留 —— 这里要的是用户
+ * 亲口说的话。除了这个参数，不要为了「兼容」再去改 collectRecords。
  */
 function extractRecords(events) {
-  const { records } = collectRecords(Array.isArray(events) ? events : [])
+  const { records } = collectRecords(Array.isArray(events) ? events : [], { purpose: 'history' })
   const out = []
   for (const r of records) {
     if (r.kind !== 'user' && r.kind !== 'assistant') continue
@@ -403,7 +408,7 @@ export function makeHistoryTool(ctx) {
   return {
     name: 'memory_history',
     description:
-      '按关键词在历史会话的原话里检索（不查记忆文件）。**只在三种时候用**：用户要的是原话或具体日期；核心记忆（memory_recall）里没有、但用户确信聊过（没提炼不等于没聊过）；核心记忆的结论过期或自相矛盾，要回源头核对。**核心记忆已命中且够答时不要调它**，那是重复付费。返回会话 id、事件序号、时间与原文片段；用 session_id + seq 可精确展开上下文。默认排除调用方自己所在的会话，避免搜到自己刚说的话；显式传 session_id 时照指定的查。只检索模型可见的当前表层：被上下文压缩折叠掉的旧消息不在结果里，需要时用 seq 展开原始日志并核对。**命中条数不等于相关**——覆盖率门槛低，擦线的片段常常只是共用了几个常见词、与问题无关，每条都要看原文再决定引用哪条。score 只用于排序，不是可信度。找不到就明确说没找到，不要用相近结果代替。',
+      '按关键词在历史会话的原话里检索（不查记忆文件）。**只在三种时候用**：用户要的是原话或具体日期；核心记忆（memory_recall）里没有、但用户确信聊过（没提炼不等于没聊过）；核心记忆的结论过期或自相矛盾，要回源头核对。**核心记忆已命中且够答时不要调它**，那是重复付费。索引只收用户与你的真实发言：宿主注入的时间戳、运行时上下文（runtime-context）、目标摘要（goal / tool-goal）、批准提示、工具提醒、后台任务通知都按来源整条排除，不会被当成谁说过的话。返回会话 id、事件序号、时间与原文片段；用 session_id + seq 可精确展开上下文。默认排除调用方自己所在的会话，避免搜到自己刚说的话；显式传 session_id 时照指定的查。只检索模型可见的当前表层：被上下文压缩折叠掉的旧消息不在结果里，需要时用 seq 展开原始日志并核对。**命中条数不等于相关**——覆盖率门槛低，擦线的片段常常只是共用了几个常见词、与问题无关，每条都要看原文再决定引用哪条。score 只用于排序，不是可信度。找不到就明确说没找到，不要用相近结果代替。',
     parameters: {
       type: 'object',
       properties: {
