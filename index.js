@@ -28,9 +28,10 @@ import {
 } from 'node:fs'
 import { basename, isAbsolute, join, resolve } from 'node:path'
 import { PROTOCOL } from './protocol.js'
-import { deriveWatermark, gatherEvents, shortSessionId } from './gather.js'
+import { deriveWatermark, eventText, gatherEvents, shortSessionId } from './gather.js'
 import { makeHistoryTool } from './history.js'
-import { recall } from './search.js'
+import { injectPick, recall } from './search.js'
+import { buildSea } from './sea.js'
 import {
   DSH_HOME,
   MEMORY_DIR,
@@ -906,6 +907,12 @@ async function handleUiRequest(ctx, req, invocation) {
     return { home: DSH_HOME, memoryDir: MEMORY_DIR, files: list(String(req?.scope ?? 'all')) }
   }
 
+  if (action === 'sea') {
+    // 铺海：纯解析、只读。archive 里的旧快照默认不加载 —— 它们会把现役
+    // 记忆挤成角落，也白拖一轮解析。要看就显式传 withArchive。
+    return buildSea({ withArchive: req?.withArchive === true })
+  }
+
   if (action === 'read') {
     const abs = resolveTarget(req?.path)
     if (!existsSync(abs)) throw new Error(`文件不存在：${relPath(abs)}`)
@@ -1117,9 +1124,189 @@ function registerHttpBridge(ctx) {
   })
 }
 
+/* ---------------------------------------------------------------- 自动召回 */
+
+/**
+ * 每轮按他刚说的那句话，带一条记忆到上下文末尾。
+ *
+ * 走 systemPrompt.context()，不走 section()。区别是实打实的：
+ *   · section() 改的是系统提示本体，一改就从那一位往后全部破前缀缓存；
+ *   · context() 的产物是一条落在对话末尾的 user 消息。宿主记着上次的 seq
+ *     和正文，正文一样就不追加、变了是替换不是堆叠（见 dsh-agent-loop 的
+ *     retained / isReplacementSurfaceEvent）。
+ * 所以这条路的实际代价只有「带进去的那点字」，不牵动缓存。
+ *
+ * 不写进导出的 inject 数组：systemPrompt 在精简部署里可能缺席，写进去会让
+ * 整个插件起不来（同 webServer 的处理）。
+ *
+ * 挑什么、怎么挑，全在 search.js 的 injectPick 里；这里只负责时机和格式。
+ */
+
+/** 注入正文的前缀。同一个字符串用来认自己 —— 注入产生的也是 user/message。 */
+const AUTO_PREFIX = '[记忆] '
+
+/** 每个会话最近一条用户原话。按会话 id 分开，多会话不串。 */
+const recentPrompt = new Map()
+
+/** 每个会话这一轮已经注入过没有 —— context 每轮会被求值两次，不拦就会重复。 */
+const injectedTurn = new Map()
+
+/**
+ * 从一条消息里取文本。
+ *
+ * 跟 gather.js 的 eventText 不是一回事：那个吃的是会话日志里的
+ * `event.data.message`，而 agent/pre-step 递过来的 messages 本身就是消息对象
+ * （`{ role, content: [{type:'text', text}] }`），外面没包 data.message。
+ */
+function textOfMessage(m) {
+  const blocks = Array.isArray(m?.content) ? m.content : []
+  const out = []
+  for (const c of blocks) if (c?.type === 'text') out.push(String(c.text ?? ''))
+  return out.join('\n')
+}
+
+/** 每次注入写一行日志，按「哪句话 + 哪条」去重，避免一轮里重复记。 */
+let lastInjectLog = ''
+
+const INJECT_LOG = join(DSH_HOME, 'memory-refine-inject.log.jsonl')
+
+/**
+ * 自检日志。注入这种「一声不响就没生效」的东西，光看结果永远猜不出断在哪环：
+ * 是 context() 压根没被调用、还是原话没记上、还是 id 没对上。每轮无论成败都
+ * 留一行，重启一次就能定位。超过 200KB 自动清空，不留垃圾。
+ */
+const DEBUG_LOG = join(DSH_HOME, 'memory-refine-inject.debug.jsonl')
+
+function dbg(row) {
+  try {
+    if (statSync(DEBUG_LOG).size > 200 * 1024) writeFileSync(DEBUG_LOG, '')
+  } catch {
+    /* 文件还不存在，第一次写自然会建 */
+  }
+  try {
+    writeFileSync(DEBUG_LOG, `${JSON.stringify({ t: new Date().toISOString(), ...row })}\n`, { flag: 'a' })
+  } catch {
+    /* 自检写不进去不该影响注入 */
+  }
+}
+
+function sessionIdOf(session) {
+  const id = session?.header?.id
+  if (typeof id === 'string' && id !== '') return id
+  return typeof session?.id === 'string' ? session.id : ''
+}
+
+/**
+ * 直接从会话里倒着找最后一条他真正说的话。
+ *
+ * **实测取不到，只当兜底**：会话里的事件类型是 `turn/start`、`agent/inbox/spliced`
+ * 这一类，**根本没有 `user/message`**（2026-10-30 的真机自检日志记下过全部类型）。
+ * 所以这条路目前恒返回空，真正在干活的是 agent/pre-step。
+ *
+ * 保留的理由：它不依赖任何时序假设。哪天宿主把用户消息也发成会话事件了，它会
+ * 自己接上，不用再改一次。注入产生的也是 user/message，必须跳过 —— 否则会拿
+ * 上一轮喂进去的那条当输入。
+ */
+function lastUserTextOf(session) {
+  try {
+    const fn = session?.snapshotEvents
+    if (typeof fn !== 'function') return ''
+    const events = fn.call(session)
+    if (!Array.isArray(events)) return ''
+    for (let i = events.length - 1; i >= 0; i--) {
+      const ev = events[i]
+      if (ev?.type !== 'user/message') continue
+      const text = eventText(ev).trim()
+      if (!text || text.startsWith(AUTO_PREFIX)) continue
+      return text
+    }
+  } catch {
+    /* 取不到就当没有 */
+  }
+  return ''
+}
+
+/**
+ * 注入正文。三行：叫一声、指出在哪、给原文。
+ *
+ * 只报**起始行**，不报范围：正文超预算会从尾部截，报「第 129—133 行」就是
+ * 撒谎。行号是拿切段位置跳过注释行算出来的，指的是正文第一行 —— 记忆文件里
+ * 每条前面都挂着一行 `<!--@refine ... -->`，直接把切段起点报出去，照号去翻
+ * 会翻到一行看不懂的东西，比不给行号更坏。
+ */
+function formatAutoRecall(pick) {
+  return `${AUTO_PREFIX}${pick.label}\n${pick.path} 第 ${pick.startLine} 行\n${pick.text}`
+}
+
+/**
+ * 每次注入记一行。门槛高低不是拍脑袋定的，得靠这张表调 —— 错塞要能翻回来，
+ * 翻的时候得看得见「他当时说了什么」和「塞进去的是哪条」。
+ */
+function logInject(query, pick) {
+  const sig = `${query}\u0000${pick.path}:${pick.startLine}`
+  if (sig === lastInjectLog) return
+  lastInjectLog = sig
+  try {
+    const row = {
+      t: new Date().toISOString(),
+      q: query.slice(0, 120),
+      path: pick.path,
+      line: pick.startLine,
+      label: pick.label,
+      terms: pick.terms,
+      score: pick.score,
+    }
+    writeFileSync(INJECT_LOG, `${JSON.stringify(row)}\n`, { flag: 'a' })
+  } catch {
+    /* 日志写不进去不该影响注入本身 */
+  }
+}
+
+function renderAutoRecall(context) {
+  try {
+    const agent = context?.agent
+    const session = agent?.session
+    const id = typeof agent?.id === 'string' ? agent.id : ''
+    if (!id) return ''
+
+    // 取「他刚说的这句」，按可靠程度排队：
+    //   ① agent/pre-step 记下的 —— 宿主在同一轮里会先跑 pre-step、再 refreshContext，
+    //      所以这一步求值时它已经有了。这是唯一在「他开口之后、模型开口之前」的窗口。
+    //   ② 按 session 的另一个 id 再找一次 —— 防两个 id 不是一回事
+    //   ③ 直接倒查会话日志 —— 不依赖任何时序假设
+    const cur = recentPrompt.get(id) ?? recentPrompt.get(sessionIdOf(session))
+    const query = cur?.text ?? lastUserTextOf(session)
+    if (!query) {
+      dbg({ at: 'context', sid: id, cur: !!cur, query: '', keys: recentPrompt.size })
+      return ''
+    }
+
+    // 同一轮只注入一条。context 在一轮里会被求值两次（组装的 initial + 请求前的
+    // refresh），不拦的话同一段记忆会被塞两遍。
+    const mark = cur?.turn !== undefined ? `t${cur.turn}` : `q${query}`
+    if (injectedTurn.get(id) === mark) return ''
+
+    const pick = injectPick(query)
+    if (!pick) {
+      injectedTurn.set(id, mark)
+      dbg({ at: 'context-miss', sid: id, query: query.slice(0, 60) })
+      return ''
+    }
+    injectedTurn.set(id, mark)
+    logInject(query, pick)
+    dbg({ at: 'context-hit', sid: id, query: query.slice(0, 60), picked: pick.label })
+    return formatAutoRecall(pick)
+  } catch (err) {
+    console.error(`[memory-refine] 自动召回失败：${err?.message ?? err}`)
+    dbg({ at: 'context-error', err: String(err?.message ?? err) })
+    return ''
+  }
+}
+
 /* ----------------------------------------------------------------- apply */
 
 export function apply(ctx) {
+  dbg({ at: 'apply' })
   ctx.effect(() => ctx.skills.register(SKILL), 'memory-refine: protocol skill')
   // 「什么时候该想起」不注册成 skill：skill 要先被加载才能读到正文，一次触发
   // 多花一趟工具往返 + 一份协议全文，而且模型会为了「按规矩走」再决定一遍。
@@ -1169,4 +1356,78 @@ export function apply(ctx) {
       }
     }, `memory-refine: ${name}`)
   }
+
+  /*
+   * 他这句话从哪拿 —— 这是整件事唯一的难点。
+   *
+   * `session/event` 那条路实测一次都没触发（debug 日志里 keys 一直是 0）——
+   * 宿主给用户消息打的是 `turn/start`、`agent/inbox/spliced`，**根本没有
+   * `user/message`**，已于 2026-10-30 连同 `rememberPrompt()` 一起删除。
+   * 而这条命脉错了就是全盘皆输：她那边五条全交白卷，一个字节都没进来。
+   *
+   * 宿主同一轮里的真实顺序是这个（见 agent-loop 的 pre-step 与 refreshContext）：
+   *
+   *     claim（把这轮消息从 inbox 取出来）
+   *       → assemble(...)            ← context() 求值 ①，此时还读不到这句话
+   *       → agent/pre-step           ← payload.messages 就是刚 claim 出来的这批
+   *       → refreshContext(...)      ← context() 求值 ②，这时候读得到了
+   *
+   * 所以在 pre-step 里把原话记下来，同一轮的求值 ② 立刻能用 —— 不用等下一轮。
+   *
+   * 严格只做副作用：`next()` 拿到的决策原样返回，一个字都不改。
+   * 这条线碰不得，改错了会把她整轮的话吞掉。
+   */
+  try {
+    ctx.on('agent/pre-step', async (payload, next) => {
+      const decision = await next()
+      try {
+        const agent = payload?.agent
+        const id = typeof agent?.id === 'string' ? agent.id : ''
+        const msgs = Array.isArray(payload?.messages) ? payload.messages : []
+        const texts = msgs.map(textOfMessage).filter((t) => t && !t.startsWith(AUTO_PREFIX))
+        if (id && texts.length) {
+          const text = texts[texts.length - 1]
+          recentPrompt.set(id, { text, at: Date.now(), turn: payload?.turn })
+          dbg({ at: 'prestep', sid: id, turn: payload?.turn, n: msgs.length, q: text.slice(0, 60) })
+        } else if (id) {
+          dbg({
+            at: 'prestep-empty',
+            sid: id,
+            turn: payload?.turn,
+            n: msgs.length,
+            m0: msgs[0] ? Object.keys(msgs[0]).slice(0, 8) : null,
+          })
+        }
+      } catch (err) {
+        dbg({ at: 'prestep-error', err: String(err?.message ?? err) })
+      }
+      return decision
+    })
+    dbg({ at: 'on-pre-step' })
+  } catch (err) {
+    console.error(`[memory-refine] 注册 pre-step 监听失败：${err?.message ?? err}`)
+    dbg({ at: 'on-pre-step-error', err: String(err?.message ?? err) })
+  }
+
+  // 自动召回。systemPrompt 是可选服务，单独等，不写进导出的 inject。
+  ctx.inject(['systemPrompt'], (sysCtx) => {
+    dbg({ at: 'inject-systemPrompt', hasService: typeof sysCtx.systemPrompt?.context === 'function' })
+    sysCtx.effect(() => {
+      try {
+        return sysCtx.systemPrompt.context({
+          name: 'memory-refine:auto-recall',
+          // 排在 TEAM_IDENTITY(125) 之后、HARNESS_SOURCE(200) 之前：
+          // 挨着身份类信息，不跟工作目录、沙箱策略那些操作规程抢位置。
+          order: 150,
+          // 记忆正文里可能有 {{…}}，不关掉插值会被当成变量展开
+          interpolate: false,
+          text: (context) => renderAutoRecall(context),
+        })
+      } catch (err) {
+        console.error(`[memory-refine] 注册自动召回失败：${err?.message ?? err}`)
+        dbg({ at: 'register-error', err: String(err?.message ?? err) })
+        return () => {}
+      }
+    }, 'memory-refine: auto recall')
+  })
 }

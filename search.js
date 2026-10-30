@@ -123,9 +123,24 @@ function labelOf(text, fallbackTitle) {
   for (const line of text.split('\n')) {
     if (isHeading(line)) continue
     const clean = plain(line)
-    if (clean) return clean.slice(0, 30)
+    if (clean) return trimLabel(clean)
   }
-  return fallbackTitle.slice(0, 30)
+  return trimLabel(fallbackTitle)
+}
+
+/**
+ * 截到 30 字，但不留半截括号。
+ *
+ * 记忆标题常写成「某事某物（2026-10-05/06 他确认要提炼的一条）」，
+ * 硬切会把右括号切掉，抬头看着像坏掉了 —— 宁可在括号前断开。
+ * 断过的都留个省略号，跟「行号只报起点」是同一个道理：截了就说截了。
+ */
+function trimLabel(s) {
+  const cut = s.slice(0, 30)
+  if (cut.length === s.length) return cut
+  const open = cut.lastIndexOf('（')
+  if (open > 0 && cut.indexOf('）', open) === -1) return cut.slice(0, open) + '…'
+  return cut + '…'
 }
 
 /**
@@ -493,5 +508,216 @@ export function recall(query, { limit = 3, scope = 'live' } = {}) {
     terms,
     hits,
     fallback: hits.length ? [] : fallbackList(),
+  }
+}
+
+/* ------------------------------------------------------------ 自动注入 */
+
+/**
+ * 自动注入挑哪一条 —— 跟 recall 是两套东西，别合并。
+ *
+ * 差别不在参数，在**输入**：recall 的 query 是模型自己抠好的实体词（工具说明
+ * 里明写着「取实体词，不要拿整句去搜」），两三个字，干净；而注入拿的是用户
+ * 原话，一句十五字的话切出十四个 bigram。用 recall 那套「覆盖率过半」的门槛，
+ * 闲聊就全军覆没 —— 实测「今天好累」「我饿了」「那个台灯的事」全是 0 条。
+ *
+ * 换判据的过程记在这里，免得下一个人（或我）又从头试一遍：
+ *
+ *   · 按「撞上稀有词」挑（df <= 4）：对话里的口头语会和生僻词混在同一个频段。
+ *     「我想」「好的」「这段」「多久」在 107 段里各只出现两三次，于是被当成
+ *     稀罕信号 —— 实测 22 句里塞了 4 条完全不相干的。
+ *   · 用「和常用词相邻就否决」挡跨词碎片：「缓存那个坑」里的「个坑」能挡住，
+ *     但「台灯」两边是「个台」「灯的」这种稀有碎片，误杀。
+ *
+ * 最后站住的是这一条：**命中词必须出现在那条记忆的标题里。**
+ *
+ *   标题是 `- **⭐ 小标题**：正文` 里那个人写的摘要，不是正文里的顺口一提。
+ *   「台灯」「雨天」「记账」「工位」都在标题上；「我想」「好的」「这段」
+ *   不会出现在任何标题里 —— 口头语天然进不了摘要，这一条比任何阈值都干净，
+ *   而且它顺手把跨词碎片也滤掉了（碎片不成词，写不进标题）。
+ *   （本段例子都是虚构的：真实记忆里的字不该被抄进代码注释。）
+ *
+ * 代价是会漏：正文里提了、标题没提的那些，永远不触发。认这个代价。
+ * 口径是**宁可漏**：漏了她还是原来那个她；错塞她会顺着错的东西往下说，
+ * 而我们还以为她想起来了。
+ */
+const INJECT = {
+  /** 全库出现段数上限：超过这个数就是常用词，不当信号。 */
+  maxDf: 12,
+  /** 全库总频次下限：低于这个数的多半是跨词碎片。 */
+  minTotal: 2,
+  /** 分数下限。一个词的 idf 约等于 ln(段数/命中段数)，见文件头第三条不变量。 */
+  minScore: 2.5,
+  /** 正文预算。注入不是精读，给多了挤占真正要说的话。 */
+  bodyChars: 800,
+}
+
+/** 切段 + 词表，按文件版本缓存：注入每轮都要问一次，不能每轮都重新分词。 */
+const injectCache = { key: '', index: null }
+
+function injectIndex() {
+  const pool = segments('live')
+  const key = pool.map((s) => `${s.path}:${s.version}:${s.startLine}`).join('|')
+  if (injectCache.key === key && injectCache.index) return injectCache.index
+
+  const N = pool.length
+  const df = new Map()
+  const total = new Map()
+  for (const seg of pool) {
+    const tf = new Map()
+    for (const t of tokenize(seg.text)) tf.set(t, (tf.get(t) ?? 0) + 1)
+    for (const [t, f] of tf) {
+      df.set(t, (df.get(t) ?? 0) + 1)
+      total.set(t, (total.get(t) ?? 0) + f)
+    }
+  }
+  const index = { pool, N, df, total, heads: pool.map((s) => headlineOf(s)) }
+  injectCache.key = key
+  injectCache.index = index
+  return index
+}
+
+/**
+ * 取一条记忆的标题。
+ *
+ * 记忆条目的真实结构是 `- **⭐ 小标题**：正文`，标题就在加粗里；没有加粗的
+ * 才退回首行前 40 字。标题是**人写的摘要**，这是整套办法唯一的锚 —— 见
+ * injectPick 的注释。
+ *
+ * 匹配前先把日期和时段剥掉。标题里普遍挂着「（2026-10-02 中午他主动交代）」，
+ * 不剥的话用户随口一句「今天中午吃什么」会命中那个「中午」，把一条讲 CS2
+ * 仓位的记忆翻出来 —— 实测就是这么错的。剥掉的只是匹配用的副本，正文不动。
+ */
+const DATE_NOTE = /20\d{2}[-/.]\d{1,2}[-/.]\d{1,2}\s*(?:凌晨|早上|上午|中午|下午|傍晚|晚上|深夜|夜里|半夜|晚)?/g
+
+/** 纯时间词不算信号：它们描述的是「什么时候聊的」，不是「聊了什么」。 */
+const TIME_WORDS = new Set(
+  '今天 明天 昨天 前天 后天 早上 上午 中午 下午 傍晚 晚上 深夜 半夜 凌晨 刚才 现在 最近 平时 每天 那天 这天 时候 时间'.split(' '),
+)
+
+function headlineOf(seg) {
+  const first = seg.text.split('\n').find((l) => !isNoiseLine(l)) ?? ''
+  const clean = stripComments(first)
+  const bold = clean.match(/\*\*(.+?)\*\*/)
+  const head = bold ? bold[1] : plain(first).slice(0, 40)
+  return head.replace(DATE_NOTE, '')
+}
+
+/** 空行，或者整行都是提炼标记 —— 都不该当「第几行」。 */
+const isNoiseLine = (line) => isBlank(line) || !stripComments(line).trim()
+
+/**
+ * 虚词：命中词里沾上一个就整个扔掉。
+ *
+ * 这条是给「标题匹配」补的最后一道。2-gram 会把词切碎，碎片散落在标题里也是
+ * 可能的 —— 「想要一个 QQ 版的我」切出「的我」，「帮我把这个文件」切出「把这」，
+ * 两句都能对上一个标题。而跨词边界切出来的碎片，几乎一定含虚词；真词几乎一定
+ * 不含（台灯、雨天、拍照、健身、沙盘、缓存、插件、日记、心理、记账）。
+ *
+ * 注意这里的判据是「沾一个就扔」，跟上面 STOP 的「两个都是虚词才扔」不是一回事：
+ * STOP 用于检索（宁可多留），这个用于注入（宁可少给）。
+ */
+const FUNC_CHARS = new Set(
+  '的了是在和与也都就很吗呢吧啊这个我你他她它们着过但被让给对从向往到为以因所之其哪怎样么把还只再才又多'.split(''),
+)
+const hasFuncChar = (gram) => [...gram].some((c) => FUNC_CHARS.has(c))
+
+/**
+ * 取给模型看的那一段正文，连同行号。
+ *
+ * 行号必须是**正文第一行的真实行号**，不能拿切段起点充数：记忆文件里每条
+ * 前面都挂着一行 `<!--@refine id=... -->`，拿切段起点会把「第 129 行」指到
+ * 那行注释上，模型照号去翻会翻到一条看不懂的东西 —— 那比不给行号更坏。
+ *
+ * 只承诺起始行，不承诺结束行：正文超预算会从尾部截断，承诺结束行就是撒谎。
+ */
+function bodyWindow(seg) {
+  const lines = seg.text.split('\n')
+  let first = 0
+  while (first < lines.length && isNoiseLine(lines[first])) first++
+
+  const out = []
+  let used = 0
+  let truncated = false
+  for (let i = first; i < lines.length; i++) {
+    const line = lines[i]
+    if (used + line.length > INJECT.bodyChars) {
+      const room = INJECT.bodyChars - used
+      if (room > 0) out.push(line.slice(0, room) + '…')
+      truncated = true
+      break
+    }
+    out.push(line)
+    used += line.length + 1
+  }
+
+  return {
+    text: out.join('\n').trim(),
+    startLine: seg.startLine + first,
+    truncated,
+  }
+}
+
+/**
+ * 拿一句用户原话，挑出最多一条要带进上下文的记忆。
+ * @param {string} query - 用户这一轮的原话，不是抠出来的词。
+ * @returns {null | {path, startLine, label, text, truncated, terms, score}}
+ */
+export function injectPick(query) {
+  const q = String(query ?? '').trim()
+  if (q.length < 2) return null
+
+  const grams = tokenize(stripComments(q))
+  if (!grams.length) return null
+
+  const { pool, N, df, total, heads } = injectIndex()
+  if (!N) return null
+
+  // 候选词：库里出现过、不是烂大街的、不含虚词、不是纯时间词。
+  //
+  // 「不是跨词碎片」这条以前写成 minTotal>=2（全库出现两次以上）。它挡得住
+  // 「忆插」这种切词时崩出来的碎片，但会误杀**独有真名**：全库只出现一次的
+  // 人名、宠物名、专有名词，正是最该被想起来的东西，一个都不能漏。而碎片不可能
+  // 出现在标题里 —— 标题是人写的一句话摘要，没人会在标题里写「忆插」。所以放宽：
+  // 只出现一次的词，只要它出现在某条标题里，就当真词收下。
+  const inSomeHead = (g) => heads.some((h) => h.includes(g))
+  const terms = [...new Set(grams)].filter((g) => {
+    const d = df.get(g) ?? 0
+    if (d <= 0 || d > INJECT.maxDf) return false
+    if (hasFuncChar(g) || TIME_WORDS.has(g)) return false
+    return (total.get(g) ?? 0) >= INJECT.minTotal || inSomeHead(g)
+  })
+  if (!terms.length) return null
+
+  // 只在标题里找。标题匹配是这套办法的全部信号源，不掺正文。
+  const scored = []
+  for (const seg of pool) {
+    const head = headlineOf(seg)
+    const hit = terms.filter((t) => head.includes(t))
+    if (!hit.length) continue
+    let score = 0
+    for (const t of hit) score += Math.log(N / df.get(t))
+    scored.push({ seg, hit, score, head })
+  }
+
+  // 同分时优先「命中词占标题的比例更高」的那条：标题越短，命中一个词就说明
+  // 这条越集中在这件事上。反例是「CS2 饰品仓位与他的保本心理」和「他的心理
+  // 健康底色」都含「心理」，该选后者。
+  const density = (c) => c.hit.join('').length / Math.max(c.head.length, 1)
+  scored.sort((a, b) => b.score - a.score || density(b) - density(a) || a.seg.startLine - b.seg.startLine)
+  const top = scored[0]
+  if (!top || top.score < INJECT.minScore) return null
+
+  const body = bodyWindow(top.seg)
+  if (!body.text) return null
+
+  return {
+    path: top.seg.path,
+    startLine: body.startLine,
+    label: top.seg.label,
+    text: body.text,
+    truncated: body.truncated,
+    terms: top.hit,
+    score: Number(top.score.toFixed(2)),
   }
 }

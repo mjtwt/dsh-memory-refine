@@ -78,7 +78,13 @@ function makeCtx() {
       }
       return undefined
     },
+    on() {
+      return () => {}
+    },
     inject(names, cb) {
+      // 只模拟真的有的服务：webServer。systemPrompt 在这种精简部署里缺席 ——
+      // cordis 的行为是**不回调**，这里得一样，否则测不出「服务缺席时插件照常起」。
+      if (!names.includes('webServer')) return () => {}
       const webCtx = makeWebCtx(ctx)
       dispatchers.push(() => cb(webCtx))
       return () => {}
