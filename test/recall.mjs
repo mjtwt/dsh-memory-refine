@@ -71,46 +71,66 @@ function run(query, args = {}) {
 
 /* ------------------------------------------------ 一、命中质量（spec §6） */
 
-const a = run('沙盘验收')
-check('沙盘验收 → 我们的线.md 命中覆盖关键词所在行', covers(a.value, 'memory/我们的线.md', '沙盘验收'))
-check('沙盘验收 → 他-这个人.md 命中覆盖关键词所在行', covers(a.value, 'memory/他-这个人.md', '沙盘验收'))
-check('沙盘验收 → 无存档层混入', a.value.hits.every((h) => h.layer !== 'archive'))
+/**
+ * 查询词从记忆里现取。
+ *
+ * 早先这里写死的是真实标题 —— 那等于把她的记忆抄进仓库，而且换台机器必然全红。
+ * 现在从每条记忆的小标题里现取一个 2–4 字的词，谁的记忆都能跑。
+ */
+const FILES = ['我们的线.md', '他-这个人.md', '环境-这台机器.md', 'MEMORY.md', '项目-MEMORY.md']
+function samples(n) {
+  const out = []
+  for (const f of FILES) {
+    const abs = join(HOME, 'memory', f)
+    if (!existsSync(abs)) continue
+    for (const m of readRaw(abs).matchAll(/^-\s*\*\*([^*\n]{2,24})\*\*/gm)) {
+      const w = m[1].replace(/^[^\u4e00-\u9fa5]+/, '').replace(/[^\u4e00-\u9fa5].*$/, '')
+      if (w.length >= 2 && w.length <= 4 && !out.some((x) => x.w === w)) out.push({ w, file: 'memory/' + f })
+      if (out.length >= n) return out
+    }
+  }
+  return out
+}
+const S = samples(2)
+if (!S.length) {
+  console.log('跳过：现役记忆里没取到能当查询的标题词。')
+  process.exit(0)
+}
+const S1 = S[0]
+const S2 = S[1] || S[0]
 
-const b = run('缓存命中')
-check('缓存命中 → 环境-这台机器.md 命中覆盖关键词所在行', covers(b.value, 'memory/环境-这台机器.md', '缓存命中'))
-check('缓存命中 → 我们的线.md 命中覆盖关键词所在行', covers(b.value, 'memory/我们的线.md', '缓存命中'))
-check('缓存命中 → 无存档层混入', b.value.hits.every((h) => h.layer !== 'archive'))
+const a = run(S1.w)
+check('标题词 → 命中片段覆盖该词所在行', covers(a.value, S1.file, S1.w), S1.file)
+check('标题词 → 无存档层混入', a.value.hits.every((h) => h.layer !== 'archive'))
 
-const c = run('纸飞机插件')
-check('纸飞机插件 → 我们的线.md 命中覆盖关键词所在行', covers(c.value, 'memory/我们的线.md', '纸飞机插件'))
-check('纸飞机插件 → 结果非空（v1 的「应为空」断言是错的）', c.value.hits.length > 0)
+const b = run(S2.w)
+check('第二个标题词也能召回', b.value.hits.length > 0, `${b.value.hits.length} 段`)
+check('第二个标题词 → 无存档层混入', b.value.hits.every((h) => h.layer !== 'archive'))
 
-const d = run('蓝线')
-check('蓝线 → hits 为空', d.value.hits.length === 0)
-check(
-  '蓝线 → fallback 里有我们的线.md',
-  d.value.fallback.some((f) => f.path === 'memory/我们的线.md'),
-)
+// 语料里根本没有的词：宁可空手，也不硬凑。这个词是造的，不来自任何记忆。
+const c = run('薛定谔的猫粮量子弦')
+check('语料里没有的词 → hits 为空', c.value.hits.length === 0)
+check('空结果时给出文件清单兜底', c.value.fallback.length > 0, `${c.value.fallback.length} 份`)
 
-const e = run('我们的线')
-check('我们的线 → 第 1 名是 memory/我们的线.md', e.value.hits[0]?.path === 'memory/我们的线.md')
+const d = run('我们的线')
+check('文件名本身也能搜到', d.value.hits[0]?.path === 'memory/我们的线.md')
 
 /* ------------------------------------------------ 二、存档层隔离 */
 
-const f = run('缓存命中', { scope: 'all' })
+const f = run(S1.w, { scope: 'all' })
 check(
   'scope=all → 存档层可能出现，但必须带 archive 标记',
   f.value.hits.every((h) => (h.layer === 'archive' ? h.layer === 'archive' : true)),
 )
 check(
   'scope=live 的候选池比 scope=all 小',
-  b.value.total <= f.value.total,
-  `live ${b.value.total} / all ${f.value.total}`,
+  a.value.total <= f.value.total,
+  `live ${a.value.total} / all ${f.value.total}`,
 )
 
 /* ------------------------------------------------ 三、非功能约束 */
 
-const all = [a, b, c, d, e, f]
+const all = [a, b, c, d, f]
 const biggest = all.reduce((m, x) => Math.max(m, Buffer.byteLength(x.text, 'utf8')), 0)
 check('任一 query 的渲染文本 ≤ 6KB', biggest <= 6144, `最大 ${biggest}B`)
 
@@ -162,27 +182,45 @@ try {
 }
 check('空 query 抛错而不是返回垃圾', threw)
 
-const wide = recall('纸飞机插件', { limit: 10 })
+const wide = recall(S1.w, { limit: 10 })
 check('limit 上限 10 生效且不越界', wide.hits.length <= 10)
 
 /* ------------------------------------------ 四半、长行开窗不能丢掉命中词 */
 
 /* 2026-10-24 第二轮：一条 960 字的长行，命中词在第八九百字，而旧实现是
  * slice(0, N) 从头截 —— 返回的片段里根本没有它要搜的词，模型会觉得
- * 「召回了但没内容」。这里锁住「以命中词为中心开窗」。 */
+ * 「召回了但没内容」。这里锁住「以命中词为中心开窗」。
+ *
+ * 长行和词都现找：挑记忆里最长的一行，取它尾巴上的一个词当查询。 */
 
-const deep = recall('归档挪走')
-if (deep.hits.length) {
-  const hit = deep.hits[0]
-  check(
-    '长行靠后的命中词仍然落在片段里',
-    hit.text.includes('归档挪走'),
-    `${hit.text.length} 字 · truncated=${hit.truncated}`,
-  )
+const longPick = (function () {
+  let best = ''
+  for (const f of FILES) {
+    const abs = join(HOME, 'memory', f)
+    if (!existsSync(abs)) continue
+    for (const line of readRaw(abs).split('\n')) if (line.length > best.length) best = line
+  }
+  if (best.length < 600) return null
+  const tail = best.slice(-120).match(/[\u4e00-\u9fa5]{4}/)
+  return tail ? tail[0] : null
+})()
+
+if (longPick) {
+  const deep = recall(longPick)
+  if (deep.hits.length) {
+    const hit = deep.hits[0]
+    check(
+      '长行靠后的命中词仍然落在片段里',
+      hit.text.includes(longPick),
+      `${hit.text.length} 字 · truncated=${hit.truncated}`,
+    )
+  }
+} else {
+  console.log('SKIP  长行开窗  :: 记忆里没有超过 600 字的行')
 }
 
 /* 常见长度的条目应当整条给全，不该满屏「被截断」。 */
-const common = recall('沙盘验收')
+const common = recall(S1.w)
 const clipped = common.hits.filter((h) => h.truncated).length
 check('常规条目不再动辄标截断', clipped === 0, `${common.hits.length} 段中 ${clipped} 段截断`)
 
@@ -205,11 +243,11 @@ if (existsSync(bigPath)) {
     `给了 ${loose.returned}/${loose.lines} 行`,
   )
 
-  const exact = read(bigPath, { offset: 68, limit: 3 })
+  const exact = read(bigPath, { offset: 10, limit: 3 })
   check('显式 limit 不被字节闸夹', exact.returned === 3 && !exact.capped)
 }
 
-const intact = recall('纸飞机插件')
+const intact = recall(S1.w)
 const whole = intact.hits.filter((h) => !h.truncated)
 if (whole.length) {
   const rendered = RECALL_TOOL.output

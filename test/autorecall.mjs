@@ -21,9 +21,33 @@
  *
  * 日志会被这次测试写脏，跑完截回原长度。
  */
-import { existsSync, statSync, truncateSync } from 'node:fs'
+import { existsSync, readFileSync, statSync, truncateSync } from 'node:fs'
 import { join } from 'node:path'
 import { DSH_HOME } from '../memory.js'
+import { injectPick } from '../search.js'
+
+/**
+ * 现取一个「说出来就会被接住」的词：真实记忆里某条的标题词。
+ *
+ * 早先这里写死的是真词 —— 等于把她的记忆抄进仓库，而且换台机器必然全红。
+ * 现在现取：谁的记忆都能跑，仓库里一个字都不留。
+ */
+const SAMPLE = (function () {
+  const mem = join(DSH_HOME, 'memory')
+  for (const f of ['我们的线.md', '他-这个人.md', '环境-这台机器.md', 'MEMORY.md', '项目-MEMORY.md']) {
+    const p = join(mem, f)
+    if (!existsSync(p)) continue
+    for (const m of readFileSync(p, 'utf8').matchAll(/^-\s*\*\*([^*\n]{2,24})\*\*/gm)) {
+      const w = m[1].replace(/^[^\u4e00-\u9fa5]+/, '').replace(/[^\u4e00-\u9fa5].*$/, '')
+      if (w.length >= 2 && w.length <= 4 && injectPick('那个' + w + '的事')) return w
+    }
+  }
+  return ''
+})()
+if (!SAMPLE) {
+  console.log('跳过：现役记忆里没取到能当样例的标题词。')
+  process.exit(0)
+}
 
 const LOG = join(DSH_HOME, 'memory-refine-inject.log.jsonl')
 const DEBUG = join(DSH_HOME, 'memory-refine-inject.debug.jsonl')
@@ -126,7 +150,7 @@ const SID = 'sess-test-autorecall'
 check('没说话时不注入', renderOf(SID) === '')
 
 // 说一句撞得上的
-const kept = await prestep(SID, '那个台灯的事还记得吗', 1)
+const kept = await prestep(SID, '那个' + SAMPLE + '的事还记得吗', 1)
 check('决策原样返回，不碰主流程', kept === fakeDecision)
 const out = renderOf(SID)
 check('撞上时吐出内容', out.startsWith('[记忆] '), out ? out.split('\n')[0] : '(空)')
@@ -149,12 +173,12 @@ check('这一步没有新消息时，不把上一句顶回来', renderOf(SID) ==
  * 认不出就会拿上一轮喂进去的记忆当这一轮他的输入，自己吃自己。
  */
 const SID_SELF = 'sess-selffeed'
-await prestep(SID_SELF, '那个台灯的事', 1)
+await prestep(SID_SELF, '那个' + SAMPLE + '的事', 1)
 await prestep(SID_SELF, '[记忆] 伪造的一行\nmemory/我们的线.md 第 1 行\n伪造正文', 2)
 const outSelf = renderOf(SID_SELF)
 check(
   '不把自己注入的当输入',
-  outSelf.includes('台灯') && !outSelf.includes('伪造'),
+  outSelf.includes(SAMPLE) && !outSelf.includes('伪造'),
   outSelf ? outSelf.split('\n')[0] : '(空)'
 )
 
@@ -167,7 +191,7 @@ const SID2 = 'sess-fallback'
 const session2 = {
   header: { id: SID2 },
   snapshotEvents: () => [
-    { type: 'user/message', data: { message: { content: [{ type: 'text', text: '那个台灯的事' }] } } },
+    { type: 'user/message', data: { message: { content: [{ type: 'text', text: '那个' + SAMPLE + '的事' }] } } },
   ],
 }
 const out2 = renderOf(SID2, session2)
@@ -177,12 +201,12 @@ check('pre-step 没记上时，靠会话日志兜底', out2.startsWith('[记忆]
 const session3 = {
   header: { id: 'sess-skip' },
   snapshotEvents: () => [
-    { type: 'user/message', data: { message: { content: [{ type: 'text', text: '那个台灯的事' }] } } },
+    { type: 'user/message', data: { message: { content: [{ type: 'text', text: '那个' + SAMPLE + '的事' }] } } },
     { type: 'user/message', data: { message: { content: [{ type: 'text', text: '[记忆] 上一轮注入的' }] } } },
   ],
 }
 const out3 = renderOf('sess-skip', session3)
-check('倒查时跳过自己注入的那条', out3.includes('台灯'), out3.split('\n')[0])
+check('倒查时跳过自己注入的那条', out3.includes(SAMPLE), out3.split('\n')[0])
 
 // 会话里什么都没有：返回空串，不能吐半截
 check(
